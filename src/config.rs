@@ -10,6 +10,8 @@ pub struct ConfigPaths {
     pub config_file: PathBuf,
     pub agent_configs: Vec<AgentDefinition>,
     pub global_rules_primary: PathBuf,
+    pub backup_dir: PathBuf,
+    pub project_id: String,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -60,11 +62,19 @@ impl ConfigPaths {
         let project_dirs = ProjectDirs::from("", "", "mooagent")
             .context("Could not determine config directory")?;
         let global_config_dir = project_dirs.config_dir();
+        let backup_dir = project_dirs.data_dir().join("backups");
 
         fs::create_dir_all(global_config_dir)?;
+        fs::create_dir_all(&backup_dir)?;
 
         let cwd = std::env::current_dir()?;
         let config_file = cwd.join(".mooagent.toml");
+        
+        let project_id = cwd
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
 
         let mut agent_configs = Vec::new();
 
@@ -120,6 +130,8 @@ impl ConfigPaths {
             config_file,
             agent_configs,
             global_rules_primary: global_config_dir.join("GLOBAL_RULES.md"),
+            backup_dir,
+            project_id,
         })
     }
 
@@ -196,27 +208,8 @@ impl ConfigPaths {
             .unwrap_or_else(|_| "Error reading project rules".to_string())
     }
 
-    pub fn read_global_content(&self, agent_def: &AgentDefinition) -> String {
-        if let Some(global_file) = &agent_def.global_file
-            && global_file.exists()
-        {
-            return fs::read_to_string(global_file)
-                .unwrap_or_else(|_| "Error reading global rules".to_string());
-        }
-        String::new()
-    }
-
-    pub fn get_merged_content(&self, agent_def: &AgentDefinition) -> String {
-        let global = self.read_global_content(agent_def);
-        let project = self.read_project_content();
-
-        if global.is_empty() {
-            project
-        } else if project.is_empty() {
-            global
-        } else {
-            format!("{}\n\n{}", global, project)
-        }
+    pub fn get_merged_content(&self, _agent_def: &AgentDefinition) -> String {
+        self.read_project_content()
     }
 
     pub fn get_agents(&self) -> Vec<AgentInfo> {
@@ -328,15 +321,22 @@ impl ConfigPaths {
     fn backup_if_needed(&self, target_path: &Path) -> Result<()> {
         if target_path.exists() {
             let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-            let mut backup = target_path.to_path_buf();
-            if let Some(ext) = target_path.extension() {
-                let mut ext_str = ext.to_os_string();
-                ext_str.push(format!(".bak.{}", timestamp));
-                backup.set_extension(ext_str);
+            let filename = target_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
+            
+            let is_global = target_path.starts_with(dirs::home_dir().unwrap_or_default())
+                && target_path != self.project_agents;
+            
+            let backup_name = if is_global {
+                format!("global_{}.{}", filename, timestamp)
             } else {
-                backup.set_extension(format!("bak.{}", timestamp));
-            }
-            fs::rename(target_path, &backup)?;
+                format!("{}_{}.{}", self.project_id, filename, timestamp)
+            };
+            
+            let backup = self.backup_dir.join(backup_name);
+            fs::copy(target_path, &backup)?;
             log::info!("Created backup: {}", backup.display());
         }
         Ok(())
@@ -349,31 +349,35 @@ impl ConfigPaths {
         }
 
         let agent = &agents[agent_index];
-        let parent = match agent.target_path.parent() {
-            Some(p) => p,
-            None => return Vec::new(),
-        };
-
-        let file_stem = agent
+        let filename = agent
             .target_path
-            .file_stem()
-            .and_then(|s| s.to_str())
+            .file_name()
+            .and_then(|n| n.to_str())
             .unwrap_or("");
+
+        let is_global = agent.target_path.starts_with(dirs::home_dir().unwrap_or_default())
+            && agent.target_path != self.project_agents;
+        
+        let prefix = if is_global {
+            format!("global_{}", filename)
+        } else {
+            format!("{}_{}", self.project_id, filename)
+        };
 
         let mut backups = Vec::new();
 
-        if let Ok(entries) = fs::read_dir(parent) {
+        if let Ok(entries) = fs::read_dir(&self.backup_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                    && name.starts_with(file_stem) && name.contains(".bak.")
+                    && name.starts_with(&prefix)
                 {
                     backups.push(path);
                 }
             }
         }
 
-        backups.sort_by(|a, b| b.cmp(a)); // Most recent first
+        backups.sort_by(|a, b| b.cmp(a));
         backups
     }
 

@@ -45,9 +45,15 @@ cargo run
 ## Keys
 
 - `q` - Quit
-- `s` - Sync agent files
+- `s` - Sync all agent files
+- `Enter` - Sync selected agent
 - `e` - Edit project rules (AGENTS.md)
-- `g` - Edit global rules (USER_RULES.md)
+- `g` - Edit global rules (syncs to all agent global files)
+- `d` - View diff for selected agent
+- `b` - View backups for selected agent
+- `a` - Toggle auto-sync
+- `/` - Search agents
+- `?` - Help
 
 ## Configuration
 
@@ -57,18 +63,26 @@ Create `.mooagent.toml` in your project root:
 [[agents]]
 name = "Claude"
 path = "CLAUDE.md"
-strategy = "merge"
+strategy = "merge"                          # copies AGENTS.md content
+global_file = "~/.claude/CLAUDE.md"         # optional: where global rules go
 
 [[agents]]
 name = "Gemini"
 path = "GEMINI.md"
-strategy = "symlink"
+strategy = "symlink"                        # symlinks to AGENTS.md
+global_file = "~/.gemini/GEMINI.md"
 ```
 
 Default agents: Claude, Gemini, OpenCode (all merge strategy).
 
-## Files
+## Architecture
 
-- `USER_RULES.md` - Global rules (in config dir)
-- `AGENTS.md` - Project-specific rules
-- Agent files are synced from merged global + project rules
+**Two-layer system:**
+1. **Global rules** (`~/.config/mooagent/GLOBAL_RULES.md`)
+   - Synced to agent-specific global files when you edit with `g`
+   - Each agent reads from their global location
+2. **Project rules** (`AGENTS.md` in project root)
+   - Synced to project-specific agent files (CLAUDE.md, etc.)
+   - Strategy determines sync method (copy vs symlink)
+
+**Backups:** Stored in `~/.local/share/mooagent/backups/`

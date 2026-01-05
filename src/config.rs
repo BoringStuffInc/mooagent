@@ -6,10 +6,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub struct ConfigPaths {
-    pub global_rules: PathBuf,
     pub project_agents: PathBuf,
     pub config_file: PathBuf,
     pub agent_configs: Vec<AgentDefinition>,
+    pub global_rules_primary: PathBuf,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -31,6 +31,7 @@ pub struct AgentDefinition {
     pub name: String,
     pub target_path: PathBuf,
     pub strategy: SyncStrategy,
+    pub global_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,6 +45,7 @@ struct ExternalAgent {
     name: String,
     path: String,
     strategy: Option<SyncStrategy>,
+    global_file: Option<String>,
 }
 
 pub struct AgentInfo {
@@ -55,7 +57,7 @@ pub struct AgentInfo {
 
 impl ConfigPaths {
     pub fn new() -> Result<Self> {
-        let project_dirs = ProjectDirs::from("", "", "agent-sync")
+        let project_dirs = ProjectDirs::from("", "", "mooagent")
             .context("Could not determine config directory")?;
         let global_config_dir = project_dirs.config_dir();
 
@@ -72,107 +74,182 @@ impl ConfigPaths {
                 toml::from_str(&content).context("Failed to parse .mooagent.toml")?;
 
             for ea in external.agents {
+                let global_file = ea.global_file.map(|p| {
+                    let path = PathBuf::from(shellexpand::tilde(&p).to_string());
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        cwd.join(path)
+                    }
+                });
+
                 agent_configs.push(AgentDefinition {
                     name: ea.name,
                     target_path: cwd.join(ea.path),
                     strategy: ea.strategy.unwrap_or(SyncStrategy::Merge),
+                    global_file,
                 });
             }
         }
 
-        // Add defaults if nothing configured or as base
         if agent_configs.is_empty() {
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+
             agent_configs.push(AgentDefinition {
                 name: "Claude".to_string(),
                 target_path: cwd.join("CLAUDE.md"),
                 strategy: SyncStrategy::Merge,
+                global_file: Some(home.join(".claude/CLAUDE.md")),
             });
             agent_configs.push(AgentDefinition {
                 name: "Gemini".to_string(),
                 target_path: cwd.join("GEMINI.md"),
                 strategy: SyncStrategy::Merge,
+                global_file: Some(home.join(".gemini/GEMINI.md")),
             });
             agent_configs.push(AgentDefinition {
                 name: "OpenCode".to_string(),
                 target_path: cwd.join(".opencode").join("rules.md"),
                 strategy: SyncStrategy::Merge,
+                global_file: Some(home.join(".config/opencode/AGENTS.md")),
             });
         }
 
         Ok(Self {
-            global_rules: global_config_dir.join("USER_RULES.md"),
             project_agents: cwd.join("AGENTS.md"),
             config_file,
             agent_configs,
+            global_rules_primary: global_config_dir.join("GLOBAL_RULES.md"),
         })
     }
 
     pub fn ensure_files_exist(&self) -> Result<()> {
-        if !self.global_rules.exists() {
-            fs::write(
-                &self.global_rules,
-                "# Global User Rules\n\nAdd your global coding preferences here.",
-            )?;
-        }
         if !self.project_agents.exists() {
             fs::write(
                 &self.project_agents,
-                "# Project Agent Rules\n\nAdd your project-specific instructions here.",
+                "# Project-Specific Agent Instructions\n\nAdd project-specific instructions here.",
             )?;
         }
+
+        if !self.global_rules_primary.exists() {
+            fs::write(
+                &self.global_rules_primary,
+                "# Global User Rules\n\nAdd your global coding preferences here.",
+            )?;
+        }
+
         Ok(())
     }
 
-    pub fn read_contents(&self) -> (String, String) {
-        let global = fs::read_to_string(&self.global_rules)
-            .unwrap_or_else(|_| "Error reading global rules".to_string());
-        let project = fs::read_to_string(&self.project_agents)
-            .unwrap_or_else(|_| "Error reading project rules".to_string());
-        (global, project)
+    pub fn sync_global_rules(&self) -> Result<()> {
+        log::info!("Syncing global rules to all agent files");
+        
+        let primary_content = if self.global_rules_primary.exists() {
+            fs::read_to_string(&self.global_rules_primary)?
+        } else {
+            String::new()
+        };
+        
+        for agent_def in &self.agent_configs {
+            if let Some(global_file) = &agent_def.global_file {
+                let needs_sync = if global_file.exists() {
+                    fs::read_to_string(global_file).ok() != Some(primary_content.clone())
+                } else {
+                    true
+                };
+
+                if needs_sync {
+                    fs::write(global_file, &primary_content)?;
+                    log::info!("Synced global rules to {}", global_file.display());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn check_global_rules_drift(&self) -> Vec<String> {
+        let mut drifted = Vec::new();
+
+        let primary_content = if self.global_rules_primary.exists() {
+            fs::read_to_string(&self.global_rules_primary).ok()
+        } else {
+            None
+        };
+
+        for agent_def in &self.agent_configs {
+            if let Some(global_file) = &agent_def.global_file
+                && global_file.exists()
+            {
+                let agent_content = fs::read_to_string(global_file).ok();
+                if agent_content != primary_content {
+                    drifted.push(agent_def.name.clone());
+                }
+            }
+        }
+
+        drifted
+    }
+
+    pub fn read_project_content(&self) -> String {
+        fs::read_to_string(&self.project_agents)
+            .unwrap_or_else(|_| "Error reading project rules".to_string())
+    }
+
+    pub fn read_global_content(&self, agent_def: &AgentDefinition) -> String {
+        if let Some(global_file) = &agent_def.global_file
+            && global_file.exists()
+        {
+            return fs::read_to_string(global_file)
+                .unwrap_or_else(|_| "Error reading global rules".to_string());
+        }
+        String::new()
+    }
+
+    pub fn get_merged_content(&self, agent_def: &AgentDefinition) -> String {
+        let global = self.read_global_content(agent_def);
+        let project = self.read_project_content();
+
+        if global.is_empty() {
+            project
+        } else if project.is_empty() {
+            global
+        } else {
+            format!("{}\n\n{}", global, project)
+        }
     }
 
     pub fn get_agents(&self) -> Vec<AgentInfo> {
-        let (global_content, project_content) = self.read_contents();
-        let merged_content = format!("{}\n\n{}", global_content, project_content);
-
         self.agent_configs
             .iter()
-            .map(|def| AgentInfo {
-                name: def.name.clone(),
-                target_path: def.target_path.clone(),
-                status: get_agent_status(
-                    &def.target_path,
-                    &self.project_agents,
-                    &merged_content,
-                    def.strategy,
-                ),
-                strategy: def.strategy,
+            .map(|def| {
+                let merged_content = self.get_merged_content(def);
+                AgentInfo {
+                    name: def.name.clone(),
+                    target_path: def.target_path.clone(),
+                    status: get_agent_status(
+                        &def.target_path,
+                        &self.project_agents,
+                        &merged_content,
+                        def.strategy,
+                    ),
+                    strategy: def.strategy,
+                }
             })
             .collect()
     }
 
     pub fn sync(&self) -> Result<String> {
         self.ensure_files_exist()?;
-        let (global_content, project_content) = self.read_contents();
-        let merged_content = format!("{}\n\n{}", global_content, project_content);
-
         let agents = self.get_agents();
         let mut synced_count = 0;
 
-        for agent in agents {
+        for (idx, agent) in agents.iter().enumerate() {
             if agent.status != AgentStatus::Ok {
-                if agent.target_path.exists() {
-                    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-                    let mut backup = agent.target_path.clone();
-                    if let Some(ext) = agent.target_path.extension() {
-                        let mut ext_str = ext.to_os_string();
-                        ext_str.push(format!(".bak.{}", timestamp));
-                        backup.set_extension(ext_str);
-                    } else {
-                        backup.set_extension(format!("bak.{}", timestamp));
-                    }
-                    let _ = fs::rename(&agent.target_path, &backup);
-                }
+                let agent_def = &self.agent_configs[idx];
+                let merged_content = self.get_merged_content(agent_def);
+
+                self.backup_if_needed(&agent.target_path)?;
 
                 if let Some(parent) = agent.target_path.parent() {
                     fs::create_dir_all(parent)?;
@@ -204,6 +281,161 @@ impl ConfigPaths {
         } else {
             Ok(format!("Successfully synced {} agent(s).", synced_count))
         }
+    }
+
+    pub fn sync_agent(&self, agent_index: usize) -> Result<String> {
+        self.ensure_files_exist()?;
+
+        if agent_index >= self.agent_configs.len() {
+            return Ok("Invalid agent index".to_string());
+        }
+
+        let agent_def = &self.agent_configs[agent_index];
+        let merged_content = self.get_merged_content(agent_def);
+        let agents = self.get_agents();
+        let agent = &agents[agent_index];
+
+        if agent.status == AgentStatus::Ok {
+            return Ok(format!("{} already in sync", agent.name));
+        }
+
+        self.backup_if_needed(&agent.target_path)?;
+
+        if let Some(parent) = agent.target_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        match agent.strategy {
+            SyncStrategy::Merge => {
+                fs::write(&agent.target_path, &merged_content)?;
+            }
+            SyncStrategy::Symlink => {
+                let target_dir = agent.target_path.parent().unwrap_or(Path::new("."));
+                let relative_source = pathdiff::diff_paths(&self.project_agents, target_dir)
+                    .unwrap_or_else(|| self.project_agents.clone());
+
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&relative_source, &agent.target_path)?;
+
+                #[cfg(windows)]
+                std::os::windows::fs::symlink_file(&relative_source, &agent.target_path)?;
+            }
+        }
+
+        Ok(format!("Successfully synced {}", agent.name))
+    }
+
+    fn backup_if_needed(&self, target_path: &Path) -> Result<()> {
+        if target_path.exists() {
+            let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+            let mut backup = target_path.to_path_buf();
+            if let Some(ext) = target_path.extension() {
+                let mut ext_str = ext.to_os_string();
+                ext_str.push(format!(".bak.{}", timestamp));
+                backup.set_extension(ext_str);
+            } else {
+                backup.set_extension(format!("bak.{}", timestamp));
+            }
+            fs::rename(target_path, &backup)?;
+            log::info!("Created backup: {}", backup.display());
+        }
+        Ok(())
+    }
+
+    pub fn list_backups(&self, agent_index: usize) -> Vec<PathBuf> {
+        let agents = self.get_agents();
+        if agent_index >= agents.len() {
+            return Vec::new();
+        }
+
+        let agent = &agents[agent_index];
+        let parent = match agent.target_path.parent() {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+
+        let file_stem = agent
+            .target_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        let mut backups = Vec::new();
+
+        if let Ok(entries) = fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && name.starts_with(file_stem) && name.contains(".bak.")
+                {
+                    backups.push(path);
+                }
+            }
+        }
+
+        backups.sort_by(|a, b| b.cmp(a)); // Most recent first
+        backups
+    }
+
+    #[allow(dead_code)]
+    pub fn restore_backup(&self, backup_path: &Path, target_path: &Path) -> Result<()> {
+        if !backup_path.exists() {
+            anyhow::bail!("Backup file does not exist");
+        }
+
+        self.backup_if_needed(target_path)?;
+
+        fs::copy(backup_path, target_path)?;
+        log::info!("Restored backup from {}", backup_path.display());
+
+        Ok(())
+    }
+
+    pub fn get_diff(&self, agent_index: usize) -> Option<String> {
+        if agent_index >= self.agent_configs.len() {
+            return None;
+        }
+
+        let agent_def = &self.agent_configs[agent_index];
+        let expected_content = self.get_merged_content(agent_def);
+
+        let agents = self.get_agents();
+        let agent = &agents[agent_index];
+
+        if agent.status != AgentStatus::Drift {
+            return None;
+        }
+
+        let actual_content = fs::read_to_string(&agent.target_path).ok()?;
+
+        Some(format!(
+            "Expected:\n{}\n\nActual:\n{}",
+            expected_content, actual_content
+        ))
+    }
+
+    #[allow(dead_code)]
+    pub fn validate_markdown(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        if self.project_agents.exists()
+            && let Ok(content) = fs::read_to_string(&self.project_agents)
+            && content.trim().is_empty()
+        {
+            warnings.push("Project agents file is empty".to_string());
+        }
+
+        for agent_def in &self.agent_configs {
+            if let Some(global_file) = &agent_def.global_file
+                && global_file.exists()
+                && let Ok(content) = fs::read_to_string(global_file)
+                && content.trim().is_empty()
+            {
+                warnings.push(format!("{} global rules file is empty", agent_def.name));
+            }
+        }
+
+        warnings
     }
 }
 

@@ -39,21 +39,37 @@ TUI for managing AI agent configuration files across multiple agents.
 ## Usage
 
 ```bash
+# Run the TUI
 cargo run
+
+# Or install it
+cargo install --path .
+mooagent
 ```
 
 ## Keys
 
-- `q` - Quit
-- `s` - Sync all agent files
-- `Enter` - Sync selected agent
-- `e` - Edit project rules (AGENTS.md)
-- `g` - Edit global rules (syncs to all agent global files)
+### Navigation
+- `Tab` / `Ctrl+w` - Cycle focus between panes (**Agent List**, **Global Rules**, **Project Rules**)
+- `h` / `l` or `←` / `→` - Move focus horizontally between rules panes
+- `j` / `k` or `↓` / `↑` - Navigate/Scroll within the focused pane
+- `gg` / `G` - Jump to Top / Bottom of focused pane
+- `Ctrl+u` / `Ctrl+d` - Half-page Up / Down focused pane
+- `Mouse Scroll` - Scroll focused pane
+
+### Actions
+- `s` - Sync all agent files (with confirmation)
+- `Enter` - Sync selected agent (with confirmation)
 - `d` - View diff for selected agent
 - `b` - View backups for selected agent
+- `Ctrl+g` - Edit global rules (syncs to all agent global files)
+- `Ctrl+e` - Edit project rules (AGENTS.md)
+- `Ctrl+c` - Edit config file (.mooagent.toml)
 - `a` - Toggle auto-sync
-- `/` - Search agents
-- `?` - Help
+- `/` - Search agents by name/path
+- `v` - Toggle status/error log
+- `?` - Show help
+- `q` / `Esc` - Quit or close dialog
 
 ## Configuration
 

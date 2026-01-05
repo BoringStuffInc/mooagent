@@ -1,4 +1,4 @@
-use crate::app::{App, AppMode};
+use crate::app::{App, AppMode, Focus};
 use crate::config::{AgentStatus, SyncStrategy};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
@@ -7,23 +7,26 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Row, Table, Wrap},
     Frame,
 };
+use std::sync::LazyLock;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 
+static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
+
 fn highlight_markdown(content: &str) -> Vec<Line<'_>> {
-    let ps = SyntaxSet::load_defaults_newlines();
-    let ts = ThemeSet::load_defaults();
+    let ps = &SYNTAX_SET;
     let syntax = ps
         .find_syntax_by_extension("md")
         .unwrap_or_else(|| ps.find_syntax_plain_text());
-    let theme = &ts.themes["base16-ocean.dark"];
+    let theme = &THEME_SET.themes["base16-ocean.dark"];
     let mut highlighter = HighlightLines::new(syntax, theme);
 
     content
         .lines()
         .map(|line| {
-            let ranges = highlighter.highlight_line(line, &ps).unwrap_or_default();
+            let ranges = highlighter.highlight_line(line, ps).unwrap_or_default();
             let spans: Vec<Span> = ranges
                 .iter()
                 .map(|(style, text)| {
@@ -45,7 +48,7 @@ fn highlight_markdown(content: &str) -> Vec<Line<'_>> {
 pub fn render(f: &mut Frame, app: &App) {
     match app.mode {
         AppMode::Help => {
-            render_help(f);
+            render_help(f, app);
             return;
         }
         AppMode::ViewDiff => {
@@ -134,11 +137,28 @@ fn render_main(f: &mut Frame, app: &App) {
         String::new()
     };
 
-    let global_title = "Global Rules (Press 'g' to edit - syncs to all agents)".to_string();
-    let global_lines = highlight_markdown(&global_content);
+    let global_lines: Vec<Line> = highlight_markdown(&global_content)
+        .into_iter()
+        .skip(app.global_scroll)
+        .collect();
+
+    let global_title = if app.focus == Focus::Global {
+        format!("Global Rules (Focused) [Line: {}]", app.global_scroll)
+    } else {
+        format!("Global Rules [Line: {}]", app.global_scroll)
+    };
 
     let global_rules = Paragraph::new(global_lines)
-        .block(Block::default().borders(Borders::ALL).title(global_title))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(global_title)
+                .border_style(if app.focus == Focus::Global {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                }),
+        )
         .wrap(Wrap { trim: true });
     f.render_widget(global_rules, workspace_chunks[0]);
 
@@ -147,11 +167,23 @@ fn render_main(f: &mut Frame, app: &App) {
         .skip(app.project_scroll)
         .collect();
 
+    let project_title = if app.focus == Focus::Project {
+        format!("Project Rules (Focused) [Line: {}]", app.project_scroll)
+    } else {
+        format!("Project Rules [Line: {}]", app.project_scroll)
+    };
+
     let project_rules = Paragraph::new(project_lines)
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            "Project Rules (AGENTS.md) [Scroll: {}]",
-            app.project_scroll
-        )))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(project_title)
+                .border_style(if app.focus == Focus::Project {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                }),
+        )
         .wrap(Wrap { trim: true });
     f.render_widget(project_rules, workspace_chunks[1]);
 
@@ -192,6 +224,16 @@ fn render_main(f: &mut Frame, app: &App) {
         })
         .collect();
 
+    let table_title = match (app.focus == Focus::Agents, app.search_query.is_empty()) {
+        (true, true) => "Agent Status Audit (Focused)".to_string(),
+        (true, false) => format!(
+            "Agent Status Audit (Focused) (filtered: {})",
+            visible_agents.len()
+        ),
+        (false, true) => "Agent Status Audit".to_string(),
+        (false, false) => format!("Agent Status Audit (filtered: {})", visible_agents.len()),
+    };
+
     let table = Table::new(
         rows,
         [
@@ -208,10 +250,11 @@ fn render_main(f: &mut Frame, app: &App) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(if app.search_query.is_empty() {
-                "Agent Status Audit".to_string()
+            .title(table_title)
+            .border_style(if app.focus == Focus::Agents {
+                Style::default().fg(Color::Yellow)
             } else {
-                format!("Agent Status Audit (filtered: {})", visible_agents.len())
+                Style::default()
             }),
     );
     f.render_widget(table, chunks[2]);
@@ -238,12 +281,16 @@ fn render_main(f: &mut Frame, app: &App) {
     let hints = Line::from(vec![
         Span::styled("[?]", Style::default().fg(Color::Cyan)),
         Span::raw(" Help | "),
-        Span::styled("[g]", Style::default().fg(Color::Cyan)),
-        Span::raw(" Edit Global | "),
-        Span::styled("[e]", Style::default().fg(Color::Cyan)),
-        Span::raw(" Edit Project | "),
+        Span::styled("[Tab]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Focus | "),
+        Span::styled("[/]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Search | "),
         Span::styled("[s]", Style::default().fg(Color::Cyan)),
-        Span::raw(" Sync | "),
+        Span::raw(" Sync All | "),
+        Span::styled("[Enter]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Sync Sel | "),
+        Span::styled("[Esc]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Clear Msg | "),
         Span::styled("[q]", Style::default().fg(Color::Cyan)),
         Span::raw(" Quit"),
         Span::styled(
@@ -358,7 +405,7 @@ fn render_error_log(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(hint), chunks[1]);
 }
 
-fn render_help(f: &mut Frame) {
+fn render_help(f: &mut Frame, app: &App) {
     let area = f.area();
 
     let help_text = vec![
@@ -368,13 +415,18 @@ fn render_help(f: &mut Frame) {
                 .add_modifier(Modifier::BOLD)
                 .fg(Color::Cyan),
         )]),
+// ... (omitting lines for brevity in instruction, but I will provide the full text in new_string)
         Line::from(""),
         Line::from(vec![Span::styled(
             "Navigation:",
             Style::default().add_modifier(Modifier::BOLD),
         )]),
-        Line::from("  j/k or ↓/↑        - Navigate agents (updates global view)"),
-        Line::from("  h/l or H/L        - Scroll project rules up/down"),
+        Line::from("  Tab / Ctrl+w      - Cycle focus between panes"),
+        Line::from("  h / l or ← / →    - Move focus between Global and Project rules"),
+        Line::from("  j / k or ↓ / ↑    - Navigate/Scroll focused pane"),
+        Line::from("  gg / G            - Jump to Top / Bottom of focused pane"),
+        Line::from("  Ctrl+u / Ctrl+d   - Half-page Up / Down focused pane"),
+        Line::from("  Mouse Scroll      - Scroll focused pane"),
         Line::from(""),
         Line::from(vec![Span::styled(
             "Actions:",
@@ -384,9 +436,9 @@ fn render_help(f: &mut Frame) {
         Line::from("  Enter             - Sync selected agent (with confirmation)"),
         Line::from("  d                 - View diff for selected agent"),
         Line::from("  b                 - View backups for selected agent"),
-        Line::from("  e                 - Edit project rules (AGENTS.md)"),
-        Line::from("  g/G               - Edit global rules (syncs to all agents)"),
-        Line::from("  c                 - Edit config file (.mooagent.toml)"),
+        Line::from("  Ctrl+g            - Edit global rules (syncs to all agents)"),
+        Line::from("  Ctrl+e            - Edit project rules (AGENTS.md)"),
+        Line::from("  Ctrl+c            - Edit config file (.mooagent.toml)"),
         Line::from("  a                 - Toggle auto-sync mode"),
         Line::from("  /                 - Search agents by name/path"),
         Line::from("  v                 - Toggle error/status log"),
@@ -430,8 +482,9 @@ fn render_help(f: &mut Frame) {
     ];
 
     let help = Paragraph::new(help_text)
-        .block(Block::default().borders(Borders::ALL).title("Help"))
-        .wrap(Wrap { trim: true });
+        .block(Block::default().borders(Borders::ALL).title(format!("Help [Scroll: j/k] [Line: {}]", app.detail_scroll)))
+        .wrap(Wrap { trim: true })
+        .scroll((app.detail_scroll as u16, 0));
 
     f.render_widget(Clear, area);
     f.render_widget(help, area);
@@ -507,13 +560,15 @@ fn render_diff(f: &mut Frame, app: &App) {
 
     let diff = Paragraph::new(diff_content)
         .block(Block::default().borders(Borders::ALL).title(format!(
-                "Diff - {}",
+                "Diff - {} [Scroll: j/k] [Line: {}]",
                 app.agents
                     .get(app.selected_agent)
                     .map(|a| a.name.as_str())
-                    .unwrap_or("Unknown")
+                    .unwrap_or("Unknown"),
+                app.detail_scroll
             )))
-        .wrap(Wrap { trim: true });
+        .wrap(Wrap { trim: true })
+        .scroll((app.detail_scroll as u16, 0));
 
     f.render_widget(Clear, area);
     f.render_widget(diff, area);
@@ -572,8 +627,9 @@ fn render_backups(f: &mut Frame, app: &App) {
     ]));
 
     let backup_list = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title("Backup Files"))
-        .wrap(Wrap { trim: true });
+        .block(Block::default().borders(Borders::ALL).title(format!("Backup Files [Scroll: j/k] [Line: {}]", app.detail_scroll)))
+        .wrap(Wrap { trim: true })
+        .scroll((app.detail_scroll as u16, 0));
 
     f.render_widget(Clear, area);
     f.render_widget(backup_list, area);

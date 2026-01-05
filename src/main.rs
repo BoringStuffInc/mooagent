@@ -5,7 +5,7 @@ mod ui;
 use crate::app::{App, AppMode};
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -97,140 +97,246 @@ where
 
         terminal.draw(|f| ui::render(f, app))?;
 
-        if event::poll(std::time::Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-        {
-            match app.mode {
-                AppMode::Help | AppMode::ViewDiff | AppMode::ViewBackups => {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            app.mode = AppMode::Normal;
-                        }
-                        _ => {}
-                    }
-                }
-                AppMode::Search => {
-                    match key.code {
-                        KeyCode::Esc => {
-                            app.clear_search();
-                            app.mode = AppMode::Normal;
-                        }
-                        KeyCode::Enter => {
-                            app.mode = AppMode::Normal;
-                        }
-                        KeyCode::Backspace => {
-                            app.backspace_search();
-                        }
-                        KeyCode::Char(c) => {
-                            app.add_search_char(c);
-                        }
-                        _ => {}
-                    }
-                }
-                AppMode::ConfirmSync => {
-                    match key.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') => {
-                            let _ = app.sync_selected();
-                            app.mode = AppMode::Normal;
-                        }
-                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                            app.mode = AppMode::Normal;
-                        }
-                        _ => {}
-                    }
-                }
-                AppMode::ConfirmSyncAll => {
-                    match key.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') => {
-                            let _ = app.sync();
-                            app.mode = AppMode::Normal;
-                        }
-                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                            app.mode = AppMode::Normal;
-                        }
-                        _ => {}
-                    }
-                }
-                AppMode::Normal => {
-                    if app.show_error_log {
-                        match key.code {
-                            KeyCode::Char('v') | KeyCode::Esc | KeyCode::Char('q') => {
-                                app.toggle_error_log();
+        if event::poll(std::time::Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(key) => {
+                                match app.mode {
+                                    AppMode::Help | AppMode::ViewDiff | AppMode::ViewBackups => {
+                                        match key.code {
+                                            KeyCode::Char('q') | KeyCode::Esc => {
+                                                app.mode = AppMode::Normal;
+                                            }
+                                            KeyCode::Char('j') | KeyCode::Down => {
+                                                app.scroll_detail_down();
+                                            }
+                                            KeyCode::Char('k') | KeyCode::Up => {
+                                                app.scroll_detail_up();
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    AppMode::Search => {
+                    
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.clear_search();
+                                    app.mode = AppMode::Normal;
+                                }
+                                KeyCode::Enter => {
+                                    app.mode = AppMode::Normal;
+                                }
+                                KeyCode::Backspace => {
+                                    app.backspace_search();
+                                }
+                                KeyCode::Char(c) => {
+                                    app.add_search_char(c);
+                                }
+                                _ => {}
                             }
+                        }
+                        AppMode::ConfirmSync => {
+                            match key.code {
+                                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                    let _ = app.sync_selected();
+                                    app.mode = AppMode::Normal;
+                                }
+                                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                    app.mode = AppMode::Normal;
+                                }
+                                _ => {}
+                            }
+                        }
+                        AppMode::ConfirmSyncAll => {
+                            match key.code {
+                                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                    let _ = app.sync();
+                                    app.mode = AppMode::Normal;
+                                }
+                                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                    app.mode = AppMode::Normal;
+                                }
+                                _ => {}
+                            }
+                        }
+                        AppMode::Normal => {
+                            if app.show_error_log {
+                                match key.code {
+                                    KeyCode::Char('v') | KeyCode::Esc | KeyCode::Char('q') => {
+                                        app.toggle_error_log();
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                match key.code {
+                                    KeyCode::Char('q') => return Ok(()),
+
+                                    KeyCode::Char('?') => {
+                                        app.detail_scroll = 0;
+                                        app.mode = AppMode::Help;
+                                    }
+
+                                    KeyCode::Char('s') => {
+                                        app.mode = AppMode::ConfirmSyncAll;
+                                    }
+
+                                    KeyCode::Enter => {
+                                        app.mode = AppMode::ConfirmSync;
+                                    }
+
+                                    KeyCode::Char('d') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                        app.detail_scroll = 0;
+                                        app.mode = AppMode::ViewDiff;
+                                    }
+
+                                    KeyCode::Char('b') => {
+                                        app.detail_scroll = 0;
+                                        app.mode = AppMode::ViewBackups;
+                                    }
+
+                                    KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                        suspend_and_run_editor(terminal, &app.paths.project_agents)?;
+                                        app.refresh();
+                                    }
+
+                                    KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                        let primary_path = app.paths.global_rules_primary.clone();
+                                        suspend_and_run_editor(terminal, &primary_path)?;
+                                        let _ = app.sync_global_rules();
+                                    }
+
+                                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                        suspend_and_run_editor(terminal, &app.paths.config_file)?;
+                                        app.refresh();
+                                    }
+
+                                    KeyCode::Char('g') => {
+                                        if app.pending_g {
+                                            app.scroll_to_top();
+                                            app.pending_g = false;
+                                        } else {
+                                            app.pending_g = true;
+                                        }
+                                    }
+
+                                    KeyCode::Char('G') => {
+                                        app.scroll_to_bottom();
+                                    }
+
+                                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                        match app.focus {
+                                            app::Focus::Agents => {
+                                                for _ in 0..5 { app.prev_agent(); }
+                                            }
+                                            app::Focus::Global => {
+                                                app.global_scroll = app.global_scroll.saturating_sub(10);
+                                            }
+                                            app::Focus::Project => {
+                                                app.scroll_project_page_up();
+                                            }
+                                        }
+                                    }
+
+                                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                        match app.focus {
+                                            app::Focus::Agents => {
+                                                for _ in 0..5 { app.next_agent(); }
+                                            }
+                                            app::Focus::Global => {
+                                                app.global_scroll += 10;
+                                                // Simplified, refresh will clamp if needed or we could do it here
+                                            }
+                                            app::Focus::Project => {
+                                                app.scroll_project_page_down();
+                                            }
+                                        }
+                                    }
+
+                                    KeyCode::Char('a') => {
+                                        app.toggle_auto_sync();
+                                    }
+
+                                    KeyCode::Char('/') => {
+                                        app.mode = AppMode::Search;
+                                    }
+
+                                    KeyCode::Char('v') => {
+                                        app.toggle_error_log();
+                                    }
+
+                                    KeyCode::Tab => {
+                                        app.next_focus();
+                                    }
+
+                                    KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                        app.next_focus();
+                                    }
+
+                                    KeyCode::Char('j') | KeyCode::Down => match app.focus {
+                                        app::Focus::Agents => app.next_agent(),
+                                        app::Focus::Global => app.scroll_global_down(),
+                                        app::Focus::Project => app.scroll_project_down(),
+                                    },
+
+                                    KeyCode::Char('k') | KeyCode::Up => match app.focus {
+                                        app::Focus::Agents => app.prev_agent(),
+                                        app::Focus::Global => app.scroll_global_up(),
+                                        app::Focus::Project => app.scroll_project_up(),
+                                    },
+
+                                    KeyCode::Char('h') | KeyCode::Left => {
+                                        app.focus_left();
+                                    }
+
+                                    KeyCode::Char('l') | KeyCode::Right => {
+                                        app.focus_right();
+                                    }
+
+                                    KeyCode::PageUp => {
+                                        app.scroll_project_page_up();
+                                    }
+
+                                    KeyCode::PageDown => {
+                                        app.scroll_project_page_down();
+                                    }
+
+                                    KeyCode::Home => {
+                                        app.scroll_project_home();
+                                    }
+
+                                    KeyCode::End => {
+                                        app.scroll_project_end();
+                                    }
+
+                                    KeyCode::Esc => {
+                                        app.status_message = None;
+                                    }
+
+                                    _ => {
+                                        app.pending_g = false;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Event::Mouse(mouse) => {
+                    if app.mode == AppMode::Normal && !app.show_error_log {
+                        match mouse.kind {
+                            MouseEventKind::ScrollDown => match app.focus {
+                                app::Focus::Agents => app.next_agent(),
+                                app::Focus::Global => app.scroll_global_down(),
+                                app::Focus::Project => app.scroll_project_down(),
+                            },
+                            MouseEventKind::ScrollUp => match app.focus {
+                                app::Focus::Agents => app.prev_agent(),
+                                app::Focus::Global => app.scroll_global_up(),
+                                app::Focus::Project => app.scroll_project_up(),
+                            },
                             _ => {}
                         }
-                    } else {
-                        match key.code {
-                            KeyCode::Char('q') => return Ok(()),
-
-                            KeyCode::Char('?') => {
-                                app.mode = AppMode::Help;
-                            }
-
-                            KeyCode::Char('s') => {
-                                app.mode = AppMode::ConfirmSyncAll;
-                            }
-
-                            KeyCode::Enter => {
-                                app.mode = AppMode::ConfirmSync;
-                            }
-
-                            KeyCode::Char('d') => {
-                                app.mode = AppMode::ViewDiff;
-                            }
-
-                            KeyCode::Char('b') => {
-                                app.mode = AppMode::ViewBackups;
-                            }
-
-                            KeyCode::Char('e') => {
-                                suspend_and_run_editor(terminal, &app.paths.project_agents)?;
-                                app.refresh();
-                            }
-
-                            KeyCode::Char('g') | KeyCode::Char('G') => {
-                                let primary_path = app.paths.global_rules_primary.clone();
-                                suspend_and_run_editor(terminal, &primary_path)?;
-                                let _ = app.sync_global_rules();
-                            }
-
-                            KeyCode::Char('c') => {
-                                suspend_and_run_editor(terminal, &app.paths.config_file)?;
-                                app.refresh();
-                            }
-
-                            KeyCode::Char('a') => {
-                                app.toggle_auto_sync();
-                            }
-
-                            KeyCode::Char('/') => {
-                                app.mode = AppMode::Search;
-                            }
-
-                            KeyCode::Char('v') => {
-                                app.toggle_error_log();
-                            }
-
-                            KeyCode::Char('j') | KeyCode::Down => {
-                                app.next_agent();
-                            }
-
-                            KeyCode::Char('k') | KeyCode::Up => {
-                                app.prev_agent();
-                            }
-
-                            KeyCode::Char('h') | KeyCode::Char('H') => {
-                                app.scroll_project_up();
-                            }
-
-                            KeyCode::Char('l') | KeyCode::Char('L') => {
-                                app.scroll_project_down();
-                            }
-
-                            _ => {}
-                        }
                     }
                 }
+                _ => {}
             }
         }
     }

@@ -345,15 +345,15 @@ pub fn get_preset_tools(group_name: &str) -> Option<Vec<&'static str>> {
     }
 }
 
-fn read_json_or_empty(path: &Path) -> serde_json::Value {
+fn read_json_or_empty(path: &Path) -> serde_json::Map<String, serde_json::Value> {
     if path.exists()
         && let Ok(content) = fs::read_to_string(path)
         && let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
-        && val.is_object()
+        && let serde_json::Value::Object(map) = val
     {
-        return val;
+        return map;
     }
-    serde_json::Value::Object(serde_json::Map::new())
+    serde_json::Map::new()
 }
 
 pub struct ClaudeConfigGenerator {
@@ -383,11 +383,7 @@ impl ConfigGenerator for ClaudeConfigGenerator {
             && (!ap.ui_settings.is_empty() || !ap.plugins.is_empty())
         {
             let settings_path = self.config_dir.join("settings.json");
-            let mut settings_value = read_json_or_empty(&settings_path);
-            if !settings_value.is_object() {
-                settings_value = serde_json::Value::Object(serde_json::Map::new());
-            }
-            let settings_map = settings_value.as_object_mut().unwrap();
+            let mut settings_map = read_json_or_empty(&settings_path);
 
             for (k, v) in &ap.ui_settings {
                 settings_map.insert(k.clone(), v.clone());
@@ -395,7 +391,7 @@ impl ConfigGenerator for ClaudeConfigGenerator {
 
             if !ap.plugins.is_empty() {
                 let plugins_obj = settings_map
-                    .entry("enabledPlugins")
+                    .entry("enabledPlugins".to_string())
                     .or_insert(serde_json::Value::Object(serde_json::Map::new()));
 
                 if let Some(plugins_map) = plugins_obj.as_object_mut() {
@@ -405,18 +401,11 @@ impl ConfigGenerator for ClaudeConfigGenerator {
                 }
             }
 
-            results.push((
-                settings_path,
-                serde_json::to_string_pretty(&settings_value)?,
-            ));
+            results.push((settings_path, serde_json::to_string_pretty(&settings_map)?));
         }
 
         if !prefs.mcp_servers.is_empty() {
-            let mut user_config = read_json_or_empty(&self.user_config_path);
-            if !user_config.is_object() {
-                user_config = serde_json::Value::Object(serde_json::Map::new());
-            }
-            let user_map = user_config.as_object_mut().unwrap();
+            let mut user_map = read_json_or_empty(&self.user_config_path);
 
             let mut servers = serde_json::Map::new();
             for (name, config) in &prefs.mcp_servers {
@@ -474,7 +463,7 @@ impl ConfigGenerator for ClaudeConfigGenerator {
 
             results.push((
                 self.user_config_path.clone(),
-                serde_json::to_string_pretty(&user_config)?,
+                serde_json::to_string_pretty(&user_map)?,
             ));
         }
 
@@ -500,15 +489,11 @@ impl ConfigGenerator for GeminiConfigGenerator {
         let mut results = Vec::new();
 
         let settings_path = self.config_dir.join("settings.json");
-        let mut settings_value = read_json_or_empty(&settings_path);
-        if !settings_value.is_object() {
-            settings_value = serde_json::Value::Object(serde_json::Map::new());
-        }
-        let settings_map = settings_value.as_object_mut().unwrap();
+        let mut settings_map = read_json_or_empty(&settings_path);
 
         if let Some(auto_accept) = prefs.general.auto_accept_tools {
             let tools_obj = settings_map
-                .entry("tools")
+                .entry("tools".to_string())
                 .or_insert(serde_json::Value::Object(serde_json::Map::new()));
             if let Some(tools_map) = tools_obj.as_object_mut() {
                 tools_map.insert(
@@ -522,7 +507,7 @@ impl ConfigGenerator for GeminiConfigGenerator {
             && !ap.ui_settings.is_empty()
         {
             let ui_obj = settings_map
-                .entry("ui")
+                .entry("ui".to_string())
                 .or_insert(serde_json::Value::Object(serde_json::Map::new()));
 
             if let Some(ui_map) = ui_obj.as_object_mut() {
@@ -572,24 +557,17 @@ impl ConfigGenerator for GeminiConfigGenerator {
             servers.insert(name.clone(), serde_json::Value::Object(server_def));
         }
         settings_map.insert("mcpServers".to_string(), serde_json::Value::Object(servers));
-        results.push((
-            settings_path,
-            serde_json::to_string_pretty(&settings_value)?,
-        ));
+        results.push((settings_path, serde_json::to_string_pretty(&settings_map)?));
 
         let enabled_tools = expand_tools(prefs);
         let tools_path = self.config_dir.join("tools.json");
-        let mut tools_value = read_json_or_empty(&tools_path);
-        if !tools_value.is_object() {
-            tools_value = serde_json::Value::Object(serde_json::Map::new());
-        }
-        let tools_map = tools_value.as_object_mut().unwrap();
+        let mut tools_map = read_json_or_empty(&tools_path);
 
         for (tool, enabled) in enabled_tools {
             tools_map.insert(tool, serde_json::Value::Bool(enabled));
         }
 
-        results.push((tools_path, serde_json::to_string_pretty(&tools_value)?));
+        results.push((tools_path, serde_json::to_string_pretty(&tools_map)?));
 
         Ok(results)
     }
@@ -612,11 +590,7 @@ impl ConfigGenerator for OpenCodeConfigGenerator {
         let mut results = Vec::new();
 
         let config_path = self.config_dir.join("opencode.json");
-        let mut config_value = read_json_or_empty(&config_path);
-        if !config_value.is_object() {
-            config_value = serde_json::Value::Object(serde_json::Map::new());
-        }
-        let config_map = config_value.as_object_mut().unwrap();
+        let mut config_map = read_json_or_empty(&config_path);
 
         config_map.insert(
             "$schema".to_string(),
@@ -672,7 +646,7 @@ impl ConfigGenerator for OpenCodeConfigGenerator {
         let enabled_tools = expand_tools(prefs);
         if !enabled_tools.is_empty() {
             let tools_obj = config_map
-                .entry("tools")
+                .entry("tools".to_string())
                 .or_insert(serde_json::Value::Object(serde_json::Map::new()));
 
             if let Some(tools_map) = tools_obj.as_object_mut() {
@@ -682,7 +656,7 @@ impl ConfigGenerator for OpenCodeConfigGenerator {
             }
         }
 
-        results.push((config_path, serde_json::to_string_pretty(&config_value)?));
+        results.push((config_path, serde_json::to_string_pretty(&config_map)?));
 
         Ok(results)
     }

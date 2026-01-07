@@ -102,8 +102,8 @@ impl OAuthFlow {
     }
 
     pub async fn discover_metadata(&mut self) -> Result<&AuthServerMetadata> {
-        if self.auth_metadata.is_some() {
-            return Ok(self.auth_metadata.as_ref().unwrap());
+        if let Some(ref metadata) = self.auth_metadata {
+            return Ok(metadata);
         }
 
         let auth_server_url = if let Some(url) = &self.config.auth_server_url {
@@ -123,7 +123,7 @@ impl OAuthFlow {
         }
 
         self.auth_metadata = Some(metadata);
-        Ok(self.auth_metadata.as_ref().unwrap())
+        Ok(self.auth_metadata.as_ref().expect("Metadata was just set"))
     }
 
     async fn discover_auth_server(&self) -> Result<String> {

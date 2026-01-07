@@ -193,6 +193,7 @@ pub struct App {
     pub paths: ConfigPaths,
     pub agents: Vec<AgentInfo>,
     pub project_content: String,
+    pub global_content: String,
     pub status_message: Option<(String, Instant)>,
     pub event_rx: Option<Receiver<()>>,
     pub selected_agent: usize,
@@ -222,6 +223,11 @@ impl App {
         let paths = ConfigPaths::new()?;
         paths.ensure_files_exist()?;
         let project_content = paths.read_project_content();
+        let global_content = if paths.global_rules_primary.exists() {
+            std::fs::read_to_string(&paths.global_rules_primary).unwrap_or_default()
+        } else {
+            String::new()
+        };
         let agents = paths.get_agents();
 
         let filtered_agents: Vec<usize> = (0..agents.len()).collect();
@@ -233,6 +239,7 @@ impl App {
             paths,
             agents,
             project_content,
+            global_content,
             status_message: None,
             event_rx,
             selected_agent: 0,
@@ -263,6 +270,11 @@ impl App {
 
     pub fn refresh(&mut self) {
         self.project_content = self.paths.read_project_content();
+        self.global_content = if self.paths.global_rules_primary.exists() {
+            std::fs::read_to_string(&self.paths.global_rules_primary).unwrap_or_default()
+        } else {
+            String::new()
+        };
         self.agents = self.paths.get_agents();
         self.preference_drift = self.paths.check_preference_drift();
 
@@ -568,6 +580,22 @@ impl App {
             }
         }
 
+        if !mcp_servers.contains_key("mooagent")
+            && let Some(mooagent_path) = dirs::home_dir()
+                .map(|h| h.join(".local/bin/mooagent"))
+                .filter(|p| p.exists())
+        {
+            mcp_servers.insert(
+                "mooagent".to_string(),
+                McpServerConfig::Stdio {
+                    command: mooagent_path.to_string_lossy().to_string(),
+                    args: vec!["--mcp".to_string()],
+                    env: std::collections::HashMap::new(),
+                },
+            );
+            added_count += 1;
+        }
+
         if added_count > 0 {
             let _ = self.paths.preferences.save_global();
             self.update_mcp_list();
@@ -820,12 +848,7 @@ impl App {
     }
 
     pub fn scroll_global_down(&mut self) {
-        let global_content = if self.paths.global_rules_primary.exists() {
-            std::fs::read_to_string(&self.paths.global_rules_primary).unwrap_or_default()
-        } else {
-            String::new()
-        };
-        let line_count = global_content.lines().count();
+        let line_count = self.global_content.lines().count();
         if self.global_scroll < line_count.saturating_sub(1) {
             self.global_scroll += 1;
         }
@@ -863,12 +886,7 @@ impl App {
                 }
             }
             Focus::Global => {
-                let content = if self.paths.global_rules_primary.exists() {
-                    std::fs::read_to_string(&self.paths.global_rules_primary).unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                self.global_scroll = content.lines().count().saturating_sub(1);
+                self.global_scroll = self.global_content.lines().count().saturating_sub(1);
             }
             Focus::Project => {
                 self.project_scroll = self.project_content.lines().count().saturating_sub(1);

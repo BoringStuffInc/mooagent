@@ -35,20 +35,19 @@ mod tests {
 
         let mut prefs = crate::preferences::AgentPreferences::default();
         let mut specific = crate::preferences::AgentSpecificPrefs::default();
-        specific.plugins.insert("git".to_string(), false); // Disable git
-        specific.plugins.insert("terminal".to_string(), true); // Enable terminal
+        specific.plugins.insert("git".to_string(), false);
+        specific.plugins.insert("terminal".to_string(), true);
         prefs.agent_specific.insert("Claude".to_string(), specific);
 
         let results = generator.generate(&prefs, None).unwrap();
 
-        // Find settings.json result
         let (_, content) = results.iter().find(|(p, _)| p == &settings_path).unwrap();
         let new_settings: serde_json::Value = serde_json::from_str(content).unwrap();
 
-        assert_eq!(new_settings["theme"], "dark"); // Preserved
-        assert_eq!(new_settings["fontSize"], 14); // Preserved
-        assert_eq!(new_settings["enabledPlugins"]["git"], false); // Updated
-        assert_eq!(new_settings["enabledPlugins"]["terminal"], true); // Added
+        assert_eq!(new_settings["theme"], "dark");
+        assert_eq!(new_settings["fontSize"], 14);
+        assert_eq!(new_settings["enabledPlugins"]["git"], false);
+        assert_eq!(new_settings["enabledPlugins"]["terminal"], true);
     }
 
     #[test]
@@ -101,10 +100,8 @@ mod tests {
             .unwrap();
         let new_config: serde_json::Value = serde_json::from_str(content).unwrap();
 
-        // Check other settings preserved
         assert_eq!(new_config["numStartups"], 10);
 
-        // Check new MCP server added with correct format
         assert!(new_config["mcpServers"]["new-server"].is_object());
         assert_eq!(new_config["mcpServers"]["new-server"]["type"], "stdio");
         assert_eq!(new_config["mcpServers"]["new-server"]["command"], "python");
@@ -120,7 +117,6 @@ mod tests {
         let config_dir = dir.path().join(".config");
         fs::create_dir_all(&config_dir).unwrap();
 
-        // Let's verify the logic by simulating what magic_mcp_setup does:
         let mut prefs = crate::preferences::AgentPreferences::default();
         let agents = vec![crate::config::AgentInfo {
             name: "Claude".to_string(),

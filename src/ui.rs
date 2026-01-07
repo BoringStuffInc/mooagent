@@ -190,12 +190,12 @@ fn render_main(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2), // Tabs
-            Constraint::Length(3), // Header
-            Constraint::Min(10),   // Central Workspace
-            Constraint::Length(6), // Footer Status Table
-            Constraint::Length(1), // Status Message
-            Constraint::Length(1), // Key Hints
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(6),
+            Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(f.area());
 
@@ -240,14 +240,7 @@ fn render_main(f: &mut Frame, app: &App) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(chunks[2]);
 
-    let global_content = if app.paths.global_rules_primary.exists() {
-        std::fs::read_to_string(&app.paths.global_rules_primary)
-            .unwrap_or_else(|_| "Error reading global rules".to_string())
-    } else {
-        String::new()
-    };
-
-    let global_lines: Vec<Line> = highlight_markdown(&global_content)
+    let global_lines: Vec<Line> = highlight_markdown(&app.global_content)
         .into_iter()
         .skip(app.global_scroll)
         .collect();
@@ -347,10 +340,10 @@ fn render_main(f: &mut Frame, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(10), // Agent
-            Constraint::Length(10), // Status
-            Constraint::Length(10), // Strategy
-            Constraint::Min(10),    // Target File
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Min(10),
         ],
     )
     .header(
@@ -769,11 +762,11 @@ fn render_preferences(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2), // Tabs
-            Constraint::Length(4), // Header
-            Constraint::Min(5),    // Main Editor
-            Constraint::Length(1), // Status Message (NEW)
-            Constraint::Length(1), // Footer/Hints
+            Constraint::Length(2),
+            Constraint::Length(4),
+            Constraint::Min(5),
+            Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(f.area());
 
@@ -814,9 +807,9 @@ fn render_preferences(f: &mut Frame, app: &App) {
     let editor_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(33), // Presets
-            Constraint::Percentage(33), // Individual Tools
-            Constraint::Percentage(33), // General
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
         ])
         .split(chunks[2]);
 
@@ -1036,11 +1029,11 @@ fn render_mcp_servers(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2), // Tabs
-            Constraint::Length(3), // Header
-            Constraint::Min(5),    // Main Content
-            Constraint::Length(1), // Status
-            Constraint::Length(1), // Footer
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(f.area());
 
@@ -1063,8 +1056,8 @@ fn render_mcp_servers(f: &mut Frame, app: &App) {
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(35), // Server List
-            Constraint::Percentage(65), // Details
+            Constraint::Percentage(35),
+            Constraint::Percentage(65),
         ])
         .split(chunks[2]);
 
@@ -1345,25 +1338,25 @@ fn render_mcp_edit_dialog(f: &mut Frame, app: &App) {
 
     if is_remote {
         let mut constraints = vec![
-            Constraint::Length(3), // Name
-            Constraint::Length(3), // Command/URL
-            Constraint::Length(3), // Auth Type
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
         ];
 
         match auth_type {
             McpAuthType::None => {
-                constraints.push(Constraint::Min(3)); // Help
+                constraints.push(Constraint::Min(3));
             }
             McpAuthType::Bearer => {
-                constraints.push(Constraint::Length(3)); // Bearer Token
-                constraints.push(Constraint::Min(3)); // Help
+                constraints.push(Constraint::Length(3));
+                constraints.push(Constraint::Min(3));
             }
             McpAuthType::OAuth => {
-                constraints.push(Constraint::Length(3)); // Client ID
-                constraints.push(Constraint::Length(3)); // Client Secret
-                constraints.push(Constraint::Length(3)); // Scopes
-                constraints.push(Constraint::Length(3)); // Auth Server URL
-                constraints.push(Constraint::Min(3)); // Help
+                constraints.push(Constraint::Length(3));
+                constraints.push(Constraint::Length(3));
+                constraints.push(Constraint::Length(3));
+                constraints.push(Constraint::Length(3));
+                constraints.push(Constraint::Min(3));
             }
         }
 
@@ -1475,11 +1468,11 @@ fn render_mcp_edit_dialog(f: &mut Frame, app: &App) {
             .direction(Direction::Vertical)
             .margin(1)
             .constraints([
-                Constraint::Length(3), // Name
-                Constraint::Length(3), // Command
-                Constraint::Length(3), // Args
-                Constraint::Length(3), // Env
-                Constraint::Min(3),    // Help
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Min(3),
             ])
             .split(dialog_area);
 

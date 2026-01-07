@@ -22,6 +22,9 @@ check:
 fmt:
     cargo fmt
 
-# Install the release version of the binary
+# Install the release binary to ~/.local/bin
 install:
-    cargo install --path . --locked
+    cargo build --release
+    mkdir -p ~/.local/bin
+    cp target/release/mooagent ~/.local/bin/mooagent
+    @echo "Installed mooagent to ~/.local/bin/mooagent"

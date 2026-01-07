@@ -1,4 +1,5 @@
 use crate::config::{AgentInfo, ConfigPaths};
+use crate::preferences::McpServerConfig;
 use anyhow::Result;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -12,6 +13,15 @@ pub enum AppMode {
     ViewDiff,
     ViewBackups,
     Search,
+    AddTool,
+    EditMcp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveTab {
+    Dashboard,
+    Preferences,
+    McpServers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +29,94 @@ pub enum Focus {
     Agents,
     Global,
     Project,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefEditorFocus {
+    Presets,
+    IndividualTools,
+    GeneralSettings,
+}
+
+pub struct PreferenceEditorState {
+    pub focus: PrefEditorFocus,
+    pub selected_preset: usize,
+    pub selected_tool: usize,
+    pub selected_general: usize,
+    pub preset_list: Vec<String>,
+    pub individual_tool_list: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpFieldFocus {
+    Name,
+    Command,
+    Args,
+    Env,
+}
+
+pub struct McpEditorState {
+    pub selected_server_idx: usize,
+    pub server_list: Vec<String>,
+
+    pub is_new: bool,
+    pub editing_name: String,
+    pub editing_command: String,
+    pub editing_args: String,
+    pub editing_env: String,
+    pub focus: McpFieldFocus,
+}
+
+impl Default for PreferenceEditorState {
+    fn default() -> Self {
+        Self {
+            focus: PrefEditorFocus::Presets,
+            selected_preset: 0,
+            selected_tool: 0,
+            selected_general: 0,
+            preset_list: vec![
+                "core_unix_tools".to_string(),
+                "file_operations".to_string(),
+                "code_search".to_string(),
+                "network_tools".to_string(),
+                "development_tools".to_string(),
+                "web_access".to_string(),
+            ],
+            individual_tool_list: vec![
+                "ls".to_string(),
+                "cd".to_string(),
+                "pwd".to_string(),
+                "grep".to_string(),
+                "find".to_string(),
+                "Read".to_string(),
+                "Write".to_string(),
+                "Edit".to_string(),
+                "Glob".to_string(),
+                "curl".to_string(),
+                "wget".to_string(),
+                "git".to_string(),
+                "npm".to_string(),
+                "cargo".to_string(),
+                "WebFetch".to_string(),
+                "WebSearch".to_string(),
+            ],
+        }
+    }
+}
+
+impl Default for McpEditorState {
+    fn default() -> Self {
+        Self {
+            selected_server_idx: 0,
+            server_list: Vec::new(),
+            is_new: false,
+            editing_name: String::new(),
+            editing_command: String::new(),
+            editing_args: String::new(),
+            editing_env: String::new(),
+            focus: McpFieldFocus::Name,
+        }
+    }
 }
 
 pub struct App {
@@ -32,6 +130,7 @@ pub struct App {
     pub global_scroll: usize,
     pub detail_scroll: usize,
     pub mode: AppMode,
+    pub active_tab: ActiveTab,
     pub focus: Focus,
     pub pending_g: bool,
     pub status_log: Vec<(String, Instant)>,
@@ -40,6 +139,11 @@ pub struct App {
     pub auto_sync: bool,
     pub filtered_agents: Vec<usize>,
     pub show_error_log: bool,
+    pub preference_drift: bool,
+    pub pref_editor_state: PreferenceEditorState,
+    pub mcp_editor_state: McpEditorState,
+    pub new_tool_input: String,
+    pub should_quit: bool,
 }
 
 impl App {
@@ -50,8 +154,8 @@ impl App {
         let agents = paths.get_agents();
 
         let filtered_agents: Vec<usize> = (0..agents.len()).collect();
-        
-        Ok(Self {
+
+        let mut app = Self {
             paths,
             agents,
             project_content,
@@ -62,6 +166,7 @@ impl App {
             global_scroll: 0,
             detail_scroll: 0,
             mode: AppMode::Normal,
+            active_tab: ActiveTab::Dashboard,
             focus: Focus::Agents,
             pending_g: false,
             status_log: Vec::new(),
@@ -70,33 +175,283 @@ impl App {
             auto_sync: false,
             filtered_agents,
             show_error_log: false,
-        })
+            preference_drift: false,
+            pref_editor_state: PreferenceEditorState::default(),
+            mcp_editor_state: McpEditorState::default(),
+            new_tool_input: String::new(),
+            should_quit: false,
+        };
+
+        app.update_mcp_list();
+        Ok(app)
     }
 
     pub fn refresh(&mut self) {
         self.project_content = self.paths.read_project_content();
         self.agents = self.paths.get_agents();
-        
+        self.preference_drift = self.paths.check_preference_drift();
+
         self.update_filter();
-        
+
         if self.selected_agent >= self.agents.len() && !self.agents.is_empty() {
             self.selected_agent = self.agents.len() - 1;
         }
-        
+
         if self.auto_sync {
             let _ = self.sync();
+        }
+
+        self.update_mcp_list();
+    }
+
+    pub fn update_mcp_list(&mut self) {
+        let mut servers: Vec<String> = self
+            .paths
+            .preferences
+            .global_prefs
+            .mcp_servers
+            .keys()
+            .cloned()
+            .collect();
+        servers.sort();
+        self.mcp_editor_state.server_list = servers;
+
+        if self.mcp_editor_state.selected_server_idx >= self.mcp_editor_state.server_list.len()
+            && !self.mcp_editor_state.server_list.is_empty()
+        {
+            self.mcp_editor_state.selected_server_idx = self.mcp_editor_state.server_list.len() - 1;
+        }
+    }
+
+    pub fn mcp_next_server(&mut self) {
+        if self.mcp_editor_state.server_list.is_empty() {
+            return;
+        }
+        if self.mcp_editor_state.selected_server_idx < self.mcp_editor_state.server_list.len() - 1 {
+            self.mcp_editor_state.selected_server_idx += 1;
+        }
+    }
+
+    pub fn mcp_prev_server(&mut self) {
+        if self.mcp_editor_state.server_list.is_empty() {
+            return;
+        }
+        if self.mcp_editor_state.selected_server_idx > 0 {
+            self.mcp_editor_state.selected_server_idx -= 1;
+        }
+    }
+
+    pub fn mcp_start_add(&mut self) {
+        self.mcp_editor_state.is_new = true;
+        self.mcp_editor_state.editing_name.clear();
+        self.mcp_editor_state.editing_command.clear();
+        self.mcp_editor_state.editing_args.clear();
+        self.mcp_editor_state.editing_env.clear();
+        self.mcp_editor_state.focus = McpFieldFocus::Name;
+        self.mode = AppMode::EditMcp;
+    }
+
+    pub fn mcp_start_edit(&mut self) {
+        if self.mcp_editor_state.server_list.is_empty() {
+            return;
+        }
+
+        let server_name =
+            &self.mcp_editor_state.server_list[self.mcp_editor_state.selected_server_idx];
+
+        if let Some(config) = self
+            .paths
+            .preferences
+            .global_prefs
+            .mcp_servers
+            .get(server_name)
+        {
+            self.mcp_editor_state.is_new = false;
+            self.mcp_editor_state.editing_name = server_name.clone();
+            match config {
+                McpServerConfig::Stdio { command, args, env } => {
+                    self.mcp_editor_state.editing_command = command.clone();
+                    self.mcp_editor_state.editing_args = args.join(" ");
+                    self.mcp_editor_state.editing_env = env
+                        .iter()
+                        .map(|(k, v)| format!("{}={}", k, v))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                }
+                McpServerConfig::Sse { url } => {
+                    self.mcp_editor_state.editing_command = url.clone();
+                    self.mcp_editor_state.editing_args.clear();
+                    self.mcp_editor_state.editing_env.clear();
+                }
+            }
+            self.mcp_editor_state.focus = McpFieldFocus::Command;
+            self.mode = AppMode::EditMcp;
+        }
+    }
+
+    pub fn mcp_delete(&mut self) {
+        if self.mcp_editor_state.server_list.is_empty() {
+            return;
+        }
+        let server_name =
+            self.mcp_editor_state.server_list[self.mcp_editor_state.selected_server_idx].clone();
+
+        self.paths
+            .preferences
+            .global_prefs
+            .mcp_servers
+            .remove(&server_name);
+        let _ = self.paths.preferences.save_global();
+        self.update_mcp_list();
+        self.set_status(format!("Deleted MCP server: {}", server_name));
+    }
+
+    pub fn mcp_submit(&mut self) {
+        let name = self.mcp_editor_state.editing_name.trim().to_string();
+        let command = self.mcp_editor_state.editing_command.trim().to_string();
+        let args: Vec<String> = self
+            .mcp_editor_state
+            .editing_args
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        let mut env = std::collections::HashMap::new();
+
+        for pair in self.mcp_editor_state.editing_env.split(',') {
+            if let Some((k, v)) = pair.split_once('=') {
+                env.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+
+        if name.is_empty() || command.is_empty() {
+            self.set_status("Name and Command/URL are required".to_string());
+            return;
+        }
+
+        let config = if command.starts_with("http://") || command.starts_with("https://") {
+            McpServerConfig::Sse { url: command }
+        } else {
+            McpServerConfig::Stdio { command, args, env }
+        };
+
+        self.paths
+            .preferences
+            .global_prefs
+            .mcp_servers
+            .insert(name.clone(), config);
+
+        let _ = self.paths.preferences.save_global();
+        self.update_mcp_list();
+        self.mode = AppMode::Normal;
+        self.set_status(format!("Saved MCP server: {} (syncs to all agents)", name));
+    }
+
+    pub fn magic_mcp_setup(&mut self) {
+        let defaults = vec![
+            (
+                "filesystem",
+                "npx",
+                vec!["-y", "@modelcontextprotocol/server-filesystem", "."],
+            ),
+            (
+                "memory",
+                "npx",
+                vec!["-y", "@modelcontextprotocol/server-memory"],
+            ),
+            ("filesystem-uvx", "uvx", vec!["mcp-server-filesystem", "."]),
+            ("memory-uvx", "uvx", vec!["mcp-server-memory"]),
+        ];
+
+        let mut added_count = 0;
+        let mcp_servers = &mut self.paths.preferences.global_prefs.mcp_servers;
+
+        for (name, cmd, args) in &defaults {
+            if !mcp_servers.contains_key(*name) {
+                mcp_servers.insert(
+                    name.to_string(),
+                    McpServerConfig::Stdio {
+                        command: cmd.to_string(),
+                        args: args.iter().map(|s| s.to_string()).collect(),
+                        env: std::collections::HashMap::new(),
+                    },
+                );
+                added_count += 1;
+            }
+        }
+
+        if added_count > 0 {
+            let _ = self.paths.preferences.save_global();
+            self.update_mcp_list();
+            self.set_status(format!(
+                "Added {} default MCP servers (sync to apply to all agents)",
+                added_count
+            ));
+        } else {
+            self.set_status("All default MCP servers already configured".to_string());
+        }
+    }
+
+    pub fn mcp_cancel(&mut self) {
+        self.mode = AppMode::Normal;
+    }
+
+    pub fn mcp_next_field(&mut self) {
+        self.mcp_editor_state.focus = match self.mcp_editor_state.focus {
+            McpFieldFocus::Name => McpFieldFocus::Command,
+            McpFieldFocus::Command => McpFieldFocus::Args,
+            McpFieldFocus::Args => McpFieldFocus::Env,
+            McpFieldFocus::Env => McpFieldFocus::Name,
+        };
+    }
+
+    pub fn mcp_input_char(&mut self, c: char) {
+        match self.mcp_editor_state.focus {
+            McpFieldFocus::Name => {
+                if self.mcp_editor_state.is_new {
+                    self.mcp_editor_state.editing_name.push(c)
+                }
+            }
+            McpFieldFocus::Command => self.mcp_editor_state.editing_command.push(c),
+            McpFieldFocus::Args => self.mcp_editor_state.editing_args.push(c),
+            McpFieldFocus::Env => self.mcp_editor_state.editing_env.push(c),
+        }
+    }
+
+    pub fn mcp_backspace(&mut self) {
+        match self.mcp_editor_state.focus {
+            McpFieldFocus::Name => {
+                if self.mcp_editor_state.is_new {
+                    let _ = self.mcp_editor_state.editing_name.pop();
+                }
+            }
+            McpFieldFocus::Command => {
+                let _ = self.mcp_editor_state.editing_command.pop();
+            }
+            McpFieldFocus::Args => {
+                let _ = self.mcp_editor_state.editing_args.pop();
+            }
+            McpFieldFocus::Env => {
+                let _ = self.mcp_editor_state.editing_env.pop();
+            }
         }
     }
 
     pub fn sync(&mut self) -> Result<()> {
-        match self.paths.sync() {
-            Ok(msg) => {
-                self.set_status(msg);
+        let agent_sync_result = self.paths.sync();
+        let pref_sync_result = self.paths.sync_preferences();
+
+        match (agent_sync_result, pref_sync_result) {
+            (Ok(agent_msg), Ok(pref_msg)) => {
+                self.set_status(format!("{} | {}", agent_msg, pref_msg));
                 self.refresh();
                 Ok(())
             }
-            Err(e) => {
-                self.set_status(format!("Error: {}", e));
+            (Err(e), _) => {
+                self.set_status(format!("Agent Sync Error: {}", e));
+                Err(e)
+            }
+            (_, Err(e)) => {
+                self.set_status(format!("Pref Sync Error: {}", e));
                 Err(e)
             }
         }
@@ -106,7 +461,7 @@ impl App {
         log::info!("{}", msg);
         self.status_message = Some((msg.clone(), Instant::now()));
         self.status_log.push((msg, Instant::now()));
-        
+
         if self.status_log.len() > 100 {
             self.status_log.drain(0..1);
         }
@@ -129,13 +484,13 @@ impl App {
             self.status_message = None;
         }
     }
-    
+
     pub fn sync_selected(&mut self) -> Result<()> {
         if self.agents.is_empty() {
             self.set_status("No agents to sync".to_string());
             return Ok(());
         }
-        
+
         match self.paths.sync_agent(self.selected_agent) {
             Ok(msg) => {
                 self.set_status(msg);
@@ -148,10 +503,11 @@ impl App {
             }
         }
     }
-    
+
     pub fn next_agent(&mut self) {
         if !self.filtered_agents.is_empty() {
-            let current_pos = self.filtered_agents
+            let current_pos = self
+                .filtered_agents
                 .iter()
                 .position(|&i| i == self.selected_agent)
                 .unwrap_or(0);
@@ -159,10 +515,11 @@ impl App {
             self.selected_agent = self.filtered_agents[next_pos];
         }
     }
-    
+
     pub fn prev_agent(&mut self) {
         if !self.filtered_agents.is_empty() {
-            let current_pos = self.filtered_agents
+            let current_pos = self
+                .filtered_agents
                 .iter()
                 .position(|&i| i == self.selected_agent)
                 .unwrap_or(0);
@@ -174,14 +531,14 @@ impl App {
             self.selected_agent = self.filtered_agents[prev_pos];
         }
     }
-    
+
     pub fn scroll_project_down(&mut self) {
         let line_count = self.project_content.lines().count();
         if self.project_scroll < line_count.saturating_sub(1) {
             self.project_scroll += 1;
         }
     }
-    
+
     pub fn scroll_project_up(&mut self) {
         if self.project_scroll > 0 {
             self.project_scroll -= 1;
@@ -262,13 +619,17 @@ impl App {
             }
         }
     }
-    
+
     pub fn toggle_auto_sync(&mut self) {
         self.auto_sync = !self.auto_sync;
-        let status = if self.auto_sync { "enabled" } else { "disabled" };
+        let status = if self.auto_sync {
+            "enabled"
+        } else {
+            "disabled"
+        };
         self.set_status(format!("Auto-sync {}", status));
     }
-    
+
     pub fn sync_global_rules(&mut self) -> Result<()> {
         match self.paths.sync_global_rules() {
             Ok(()) => {
@@ -282,42 +643,51 @@ impl App {
             }
         }
     }
-    
+
     pub fn update_filter(&mut self) {
         if self.search_query.is_empty() {
             self.filtered_agents = (0..self.agents.len()).collect();
         } else {
-            self.filtered_agents = self.agents
+            self.filtered_agents = self
+                .agents
                 .iter()
                 .enumerate()
                 .filter(|(_, agent)| {
-                    agent.name.to_lowercase().contains(&self.search_query.to_lowercase())
-                        || agent.target_path.to_string_lossy().to_lowercase().contains(&self.search_query.to_lowercase())
+                    agent
+                        .name
+                        .to_lowercase()
+                        .contains(&self.search_query.to_lowercase())
+                        || agent
+                            .target_path
+                            .to_string_lossy()
+                            .to_lowercase()
+                            .contains(&self.search_query.to_lowercase())
                 })
                 .map(|(i, _)| i)
                 .collect();
         }
 
-        if !self.filtered_agents.is_empty() && !self.filtered_agents.contains(&self.selected_agent) {
+        if !self.filtered_agents.is_empty() && !self.filtered_agents.contains(&self.selected_agent)
+        {
             self.selected_agent = self.filtered_agents[0];
         }
     }
-    
+
     pub fn add_search_char(&mut self, c: char) {
         self.search_query.push(c);
         self.update_filter();
     }
-    
+
     pub fn backspace_search(&mut self) {
         self.search_query.pop();
         self.update_filter();
     }
-    
+
     pub fn clear_search(&mut self) {
         self.search_query.clear();
         self.update_filter();
     }
-    
+
     pub fn toggle_error_log(&mut self) {
         self.show_error_log = !self.show_error_log;
     }
@@ -343,11 +713,186 @@ impl App {
             _ => self.focus,
         };
     }
-    
+
     pub fn get_visible_agents(&self) -> Vec<&AgentInfo> {
         self.filtered_agents
             .iter()
             .filter_map(|&idx| self.agents.get(idx))
             .collect()
+    }
+
+    pub fn sync_preferences(&mut self) -> Result<()> {
+        match self.paths.sync_preferences() {
+            Ok(msg) => {
+                self.set_status(msg);
+                self.refresh();
+                Ok(())
+            }
+            Err(e) => {
+                self.set_status(format!("Error syncing preferences: {}", e));
+                Err(e)
+            }
+        }
+    }
+
+    pub fn pref_next_focus(&mut self) {
+        self.pref_editor_state.focus = match self.pref_editor_state.focus {
+            PrefEditorFocus::Presets => PrefEditorFocus::IndividualTools,
+            PrefEditorFocus::IndividualTools => PrefEditorFocus::GeneralSettings,
+            PrefEditorFocus::GeneralSettings => PrefEditorFocus::Presets,
+        };
+    }
+
+    pub fn pref_scroll_down(&mut self) {
+        match self.pref_editor_state.focus {
+            PrefEditorFocus::Presets => {
+                if self.pref_editor_state.selected_preset
+                    < self.pref_editor_state.preset_list.len().saturating_sub(1)
+                {
+                    self.pref_editor_state.selected_preset += 1;
+                }
+            }
+            PrefEditorFocus::IndividualTools => {
+                if self.pref_editor_state.selected_tool
+                    < self
+                        .pref_editor_state
+                        .individual_tool_list
+                        .len()
+                        .saturating_sub(1)
+                {
+                    self.pref_editor_state.selected_tool += 1;
+                }
+            }
+            PrefEditorFocus::GeneralSettings => {
+                if self.pref_editor_state.selected_general < 2 {
+                    self.pref_editor_state.selected_general += 1;
+                }
+            }
+        }
+    }
+
+    pub fn pref_scroll_up(&mut self) {
+        match self.pref_editor_state.focus {
+            PrefEditorFocus::Presets => {
+                if self.pref_editor_state.selected_preset > 0 {
+                    self.pref_editor_state.selected_preset -= 1;
+                }
+            }
+            PrefEditorFocus::IndividualTools => {
+                if self.pref_editor_state.selected_tool > 0 {
+                    self.pref_editor_state.selected_tool -= 1;
+                }
+            }
+            PrefEditorFocus::GeneralSettings => {
+                if self.pref_editor_state.selected_general > 0 {
+                    self.pref_editor_state.selected_general -= 1;
+                }
+            }
+        }
+    }
+
+    pub fn pref_toggle_item(&mut self) {
+        let mgr = &mut self.paths.preferences;
+
+        match self.pref_editor_state.focus {
+            PrefEditorFocus::Presets => {
+                if let Some(preset_name) = self
+                    .pref_editor_state
+                    .preset_list
+                    .get(self.pref_editor_state.selected_preset)
+                {
+                    if let Some(group) = mgr.global_prefs.tool_presets.get_mut(preset_name) {
+                        group.enabled = !group.enabled;
+                    } else {
+                        mgr.global_prefs.tool_presets.insert(
+                            preset_name.clone(),
+                            crate::preferences::PresetGroup { enabled: true },
+                        );
+                    }
+                }
+            }
+            PrefEditorFocus::IndividualTools => {
+                if let Some(tool_name) = self
+                    .pref_editor_state
+                    .individual_tool_list
+                    .get(self.pref_editor_state.selected_tool)
+                {
+                    let current = *mgr
+                        .global_prefs
+                        .individual_tools
+                        .get(tool_name)
+                        .unwrap_or(&false);
+                    mgr.global_prefs
+                        .individual_tools
+                        .insert(tool_name.clone(), !current);
+                }
+            }
+            PrefEditorFocus::GeneralSettings => match self.pref_editor_state.selected_general {
+                0 => {
+                    let current = mgr.global_prefs.general.auto_accept_tools.unwrap_or(true);
+                    mgr.global_prefs.general.auto_accept_tools = Some(!current);
+                }
+                1 => {
+                    let current = mgr.global_prefs.general.enable_logging.unwrap_or(true);
+                    mgr.global_prefs.general.enable_logging = Some(!current);
+                }
+                2 => {
+                    let current = mgr.global_prefs.general.sandboxed_mode.unwrap_or(true);
+                    mgr.global_prefs.general.sandboxed_mode = Some(!current);
+                }
+                _ => {}
+            },
+        }
+
+        let _ = mgr.save_global();
+        self.refresh();
+    }
+
+    pub fn add_tool_char(&mut self, c: char) {
+        self.new_tool_input.push(c);
+    }
+
+    pub fn backspace_add_tool(&mut self) {
+        self.new_tool_input.pop();
+    }
+
+    pub fn submit_new_tool(&mut self) {
+        if !self.new_tool_input.trim().is_empty() {
+            let tool_name = self.new_tool_input.trim().to_string();
+
+            if !self
+                .pref_editor_state
+                .individual_tool_list
+                .contains(&tool_name)
+            {
+                self.pref_editor_state
+                    .individual_tool_list
+                    .push(tool_name.clone());
+                self.pref_editor_state.individual_tool_list.sort();
+
+                if let Some(pos) = self
+                    .pref_editor_state
+                    .individual_tool_list
+                    .iter()
+                    .position(|t| t == &tool_name)
+                {
+                    self.pref_editor_state.selected_tool = pos;
+                }
+
+                self.paths
+                    .preferences
+                    .global_prefs
+                    .individual_tools
+                    .insert(tool_name, true);
+                let _ = self.paths.preferences.save_global();
+            }
+        }
+        self.new_tool_input.clear();
+        self.mode = AppMode::Normal;
+    }
+
+    pub fn cancel_add_tool(&mut self) {
+        self.new_tool_input.clear();
+        self.mode = AppMode::Normal;
     }
 }

@@ -1,11 +1,11 @@
-use crate::app::{App, AppMode, Focus};
+use crate::app::{ActiveTab, App, AppMode, Focus, McpFieldFocus, PrefEditorFocus};
 use crate::config::{AgentStatus, SyncStrategy};
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    Frame,
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Row, Table, Wrap},
-    Frame,
+    widgets::{Block, Borders, Clear, Paragraph, Row, Table, Tabs, Wrap},
 };
 use std::sync::LazyLock;
 use syntect::easy::HighlightLines;
@@ -60,8 +60,10 @@ pub fn render(f: &mut Frame, app: &App) {
             return;
         }
         AppMode::Search => {
-            render_main(f, app);
-            render_search_dialog(f, app);
+            if app.active_tab == ActiveTab::Dashboard {
+                render_main(f, app);
+                render_search_dialog(f, app);
+            }
             return;
         }
         AppMode::ConfirmSync | AppMode::ConfirmSyncAll => {
@@ -69,27 +71,64 @@ pub fn render(f: &mut Frame, app: &App) {
             render_confirm_dialog(f, app);
             return;
         }
-        _ => {}
+        AppMode::AddTool => {
+            render_preferences(f, app);
+            render_add_tool_dialog(f, app);
+            return;
+        }
+        AppMode::EditMcp => {
+            render_mcp_servers(f, app);
+            render_mcp_edit_dialog(f, app);
+            return;
+        }
+        AppMode::Normal => match app.active_tab {
+            ActiveTab::Dashboard => render_main(f, app),
+            ActiveTab::Preferences => render_preferences(f, app),
+            ActiveTab::McpServers => render_mcp_servers(f, app),
+        },
     }
 
     if app.show_error_log {
         render_error_log(f, app);
-    } else {
-        render_main(f, app);
     }
+}
+
+fn render_tabs(f: &mut Frame, app: &App, area: Rect) {
+    let titles = vec!["[1] Dashboard", "[2] Preferences", "[3] MCP Servers"];
+    let index = match app.active_tab {
+        ActiveTab::Dashboard => 0,
+        ActiveTab::Preferences => 1,
+        ActiveTab::McpServers => 2,
+    };
+
+    let tabs = Tabs::new(titles)
+        .select(index)
+        .block(Block::default().borders(Borders::BOTTOM))
+        .style(Style::default().fg(Color::White))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .divider(Span::raw("|"));
+
+    f.render_widget(tabs, area);
 }
 
 fn render_main(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(2), // Tabs
             Constraint::Length(3), // Header
             Constraint::Min(10),   // Central Workspace
-            Constraint::Length(6), // Footer Status Table (increased height slightly)
+            Constraint::Length(6), // Footer Status Table
             Constraint::Length(1), // Status Message
             Constraint::Length(1), // Key Hints
         ])
         .split(f.area());
+
+    render_tabs(f, app, chunks[0]);
 
     let drifted_agents = app.paths.check_global_rules_drift();
     let sync_indicator = if drifted_agents.is_empty() {
@@ -123,12 +162,12 @@ fn render_main(f: &mut Frame, app: &App) {
             .borders(Borders::ALL)
             .title("MooAgent - Agent Context Manager"),
     );
-    f.render_widget(header, chunks[0]);
+    f.render_widget(header, chunks[1]);
 
     let workspace_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[1]);
+        .split(chunks[2]);
 
     let global_content = if app.paths.global_rules_primary.exists() {
         std::fs::read_to_string(&app.paths.global_rules_primary)
@@ -257,7 +296,7 @@ fn render_main(f: &mut Frame, app: &App) {
                 Style::default()
             }),
     );
-    f.render_widget(table, chunks[2]);
+    f.render_widget(table, chunks[3]);
 
     if let Some((msg, _)) = &app.status_message {
         f.render_widget(
@@ -267,7 +306,7 @@ fn render_main(f: &mut Frame, app: &App) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )),
-            chunks[3],
+            chunks[4],
         );
     }
 
@@ -279,6 +318,8 @@ fn render_main(f: &mut Frame, app: &App) {
     };
 
     let hints = Line::from(vec![
+        Span::styled("[1/2/3]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Tabs | "),
         Span::styled("[?]", Style::default().fg(Color::Cyan)),
         Span::raw(" Help | "),
         Span::styled("[Tab]", Style::default().fg(Color::Cyan)),
@@ -306,7 +347,7 @@ fn render_main(f: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
     ]);
-    f.render_widget(Paragraph::new(hints), chunks[4]);
+    f.render_widget(Paragraph::new(hints), chunks[5]);
 }
 
 fn render_search_dialog(f: &mut Frame, app: &App) {
@@ -415,7 +456,6 @@ fn render_help(f: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD)
                 .fg(Color::Cyan),
         )]),
-// ... (omitting lines for brevity in instruction, but I will provide the full text in new_string)
         Line::from(""),
         Line::from(vec![Span::styled(
             "Navigation:",
@@ -439,6 +479,7 @@ fn render_help(f: &mut Frame, app: &App) {
         Line::from("  Ctrl+g            - Edit global rules (syncs to all agents)"),
         Line::from("  Ctrl+e            - Edit project rules (AGENTS.md)"),
         Line::from("  Ctrl+c            - Edit config file (.mooagent.toml)"),
+        Line::from("  Ctrl+p            - Open Preference Editor (Tool permissions, MCP)"),
         Line::from("  a                 - Toggle auto-sync mode"),
         Line::from("  /                 - Search agents by name/path"),
         Line::from("  v                 - Toggle error/status log"),
@@ -482,7 +523,11 @@ fn render_help(f: &mut Frame, app: &App) {
     ];
 
     let help = Paragraph::new(help_text)
-        .block(Block::default().borders(Borders::ALL).title(format!("Help [Scroll: j/k] [Line: {}]", app.detail_scroll)))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Help [Scroll: j/k] [Line: {}]", app.detail_scroll)),
+        )
         .wrap(Wrap { trim: true })
         .scroll((app.detail_scroll as u16, 0));
 
@@ -627,10 +672,572 @@ fn render_backups(f: &mut Frame, app: &App) {
     ]));
 
     let backup_list = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(format!("Backup Files [Scroll: j/k] [Line: {}]", app.detail_scroll)))
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            "Backup Files [Scroll: j/k] [Line: {}]",
+            app.detail_scroll
+        )))
         .wrap(Wrap { trim: true })
         .scroll((app.detail_scroll as u16, 0));
 
     f.render_widget(Clear, area);
     f.render_widget(backup_list, area);
+}
+
+fn render_preferences(f: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2), // Tabs
+            Constraint::Length(4), // Header
+            Constraint::Min(5),    // Main Editor
+            Constraint::Length(1), // Status Message (NEW)
+            Constraint::Length(1), // Footer/Hints
+        ])
+        .split(f.area());
+
+    render_tabs(f, app, chunks[0]);
+
+    let drift_status = if app.preference_drift {
+        Span::styled(
+            " [DRIFT DETECTED - Sync Recommended]",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(" [Synced]", Style::default().fg(Color::Green))
+    };
+
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(
+                "Preference Editor: ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Global preferences (synced to all agents)"),
+            drift_status,
+        ]),
+        Line::from(vec![
+            Span::styled("Path: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(app.paths.preferences.global_path.display().to_string()),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("MooAgent Preferences"),
+    );
+    f.render_widget(header, chunks[1]);
+
+    let editor_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(33), // Presets
+            Constraint::Percentage(33), // Individual Tools
+            Constraint::Percentage(33), // General
+        ])
+        .split(chunks[2]);
+
+    render_presets_panel(f, app, editor_chunks[0]);
+
+    render_tools_panel(f, app, editor_chunks[1]);
+
+    render_general_panel(f, app, editor_chunks[2]);
+
+    if let Some((msg, _)) = &app.status_message {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                msg,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            chunks[3],
+        );
+    }
+
+    let mut hint_vec = vec![
+        Span::styled("[1/2]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Tabs | "),
+        Span::styled("[Tab]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Next Panel | "),
+        Span::styled("[Space]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Toggle | "),
+    ];
+
+    if app.pref_editor_state.focus == PrefEditorFocus::IndividualTools {
+        hint_vec.push(Span::styled("[a]", Style::default().fg(Color::Cyan)));
+        hint_vec.push(Span::raw(" Add Tool | "));
+    }
+
+    hint_vec.push(Span::styled("[s]", Style::default().fg(Color::Cyan)));
+    hint_vec.push(Span::raw(" Sync Configs | "));
+    hint_vec.push(Span::styled("[q/Esc]", Style::default().fg(Color::Cyan)));
+    hint_vec.push(Span::raw(" Back to Main"));
+
+    let hints = Line::from(hint_vec);
+    f.render_widget(Paragraph::new(hints), chunks[4]);
+}
+
+fn render_add_tool_dialog(f: &mut Frame, app: &App) {
+    let area = f.area();
+
+    let popup_width = 60;
+    let popup_height = 5;
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+
+    let popup_area = ratatui::layout::Rect {
+        x,
+        y,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("Tool Name: "),
+            Span::styled(
+                &app.new_tool_input,
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+        ]),
+        Line::from(""),
+        Line::from("[Esc] Cancel | [Enter] Add Tool"),
+    ];
+
+    let dialog = Paragraph::new(text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Add Individual Tool")
+            .style(Style::default().bg(Color::Black)),
+    );
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(dialog, popup_area);
+}
+
+fn render_presets_panel(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let is_focused = app.pref_editor_state.focus == PrefEditorFocus::Presets;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Tool Presets")
+        .border_style(if is_focused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        });
+
+    let mut lines = Vec::new();
+    let mgr = &app.paths.preferences;
+
+    for (idx, preset) in app.pref_editor_state.preset_list.iter().enumerate() {
+        let enabled = mgr
+            .global_prefs
+            .tool_presets
+            .get(preset)
+            .map(|g| g.enabled)
+            .unwrap_or(false);
+        let check = if enabled { "[x]" } else { "[ ]" };
+        let style = if is_focused && idx == app.pref_editor_state.selected_preset {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else if enabled {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        lines.push(Line::from(vec![Span::styled(
+            format!("{} {}", check, preset),
+            style,
+        )]));
+    }
+
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn render_tools_panel(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let is_focused = app.pref_editor_state.focus == PrefEditorFocus::IndividualTools;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Individual Tools")
+        .border_style(if is_focused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        });
+
+    let mut lines = Vec::new();
+    let mgr = &app.paths.preferences;
+
+    for (idx, tool) in app
+        .pref_editor_state
+        .individual_tool_list
+        .iter()
+        .enumerate()
+    {
+        let enabled = *mgr
+            .global_prefs
+            .individual_tools
+            .get(tool)
+            .unwrap_or(&false);
+        let check = if enabled { "[x]" } else { "[ ]" };
+        let style = if is_focused && idx == app.pref_editor_state.selected_tool {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else if enabled {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        lines.push(Line::from(vec![Span::styled(
+            format!("{} {}", check, tool),
+            style,
+        )]));
+    }
+
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn render_general_panel(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let is_focused = app.pref_editor_state.focus == PrefEditorFocus::GeneralSettings;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("General Settings")
+        .border_style(if is_focused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        });
+
+    let mut lines = Vec::new();
+    let mgr = &app.paths.preferences;
+    let general_prefs = &mgr.global_prefs.general;
+
+    let settings = [
+        (
+            "Auto-Accept Tools",
+            general_prefs.auto_accept_tools.unwrap_or(true),
+        ),
+        (
+            "Enable Logging",
+            general_prefs.enable_logging.unwrap_or(true),
+        ),
+        (
+            "Sandboxed Mode",
+            general_prefs.sandboxed_mode.unwrap_or(true),
+        ),
+    ];
+
+    for (idx, (name, val)) in settings.iter().enumerate() {
+        let check = if *val { "[x]" } else { "[ ]" };
+        let style = if is_focused && idx == app.pref_editor_state.selected_general {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else if *val {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        lines.push(Line::from(vec![Span::styled(
+            format!("{} {}", check, name),
+            style,
+        )]));
+    }
+
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn render_mcp_servers(f: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2), // Tabs
+            Constraint::Length(3), // Header
+            Constraint::Min(5),    // Main Content
+            Constraint::Length(1), // Status
+            Constraint::Length(1), // Footer
+        ])
+        .split(f.area());
+
+    render_tabs(f, app, chunks[0]);
+
+    let header = Paragraph::new(vec![Line::from(vec![
+        Span::styled(
+            "Global MCP Servers: ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("Define once, sync to all agents (Claude, Gemini, OpenCode)"),
+    ])])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("MooAgent MCP Config"),
+    );
+    f.render_widget(header, chunks[1]);
+
+    let main_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(35), // Server List
+            Constraint::Percentage(65), // Details
+        ])
+        .split(chunks[2]);
+
+    let servers: Vec<Line> = if app.mcp_editor_state.server_list.is_empty() {
+        vec![Line::from(Span::styled(
+            "  No MCP servers configured",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        app.mcp_editor_state
+            .server_list
+            .iter()
+            .enumerate()
+            .map(|(idx, server)| {
+                let style = if idx == app.mcp_editor_state.selected_server_idx {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                Line::from(vec![Span::styled(format!("  {}", server), style)])
+            })
+            .collect()
+    };
+
+    let servers_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title("MCP Servers [j/k]");
+    f.render_widget(Paragraph::new(servers).block(servers_block), main_chunks[0]);
+
+    let mut details = Vec::new();
+    if !app.mcp_editor_state.server_list.is_empty() {
+        let server_name =
+            &app.mcp_editor_state.server_list[app.mcp_editor_state.selected_server_idx];
+
+        if let Some(config) = app
+            .paths
+            .preferences
+            .global_prefs
+            .mcp_servers
+            .get(server_name)
+        {
+            details.push(Line::from(vec![
+                Span::styled("Name: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(server_name),
+            ]));
+            details.push(Line::from(""));
+
+            match config {
+                crate::preferences::McpServerConfig::Stdio { command, args, env } => {
+                    details.push(Line::from(vec![
+                        Span::styled("Type: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::styled("local (stdio)", Style::default().fg(Color::Green)),
+                    ]));
+                    details.push(Line::from(""));
+
+                    details.push(Line::from(vec![
+                        Span::styled("Command: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(command),
+                    ]));
+                    details.push(Line::from(""));
+
+                    if !args.is_empty() {
+                        details.push(Line::from(vec![
+                            Span::styled("Args: ", Style::default().add_modifier(Modifier::BOLD)),
+                            Span::raw(args.join(" ")),
+                        ]));
+                        details.push(Line::from(""));
+                    }
+
+                    if !env.is_empty() {
+                        details.push(Line::from(vec![Span::styled(
+                            "Environment:",
+                            Style::default().add_modifier(Modifier::BOLD),
+                        )]));
+                        for (k, v) in env {
+                            details.push(Line::from(format!("  {}={}", k, v)));
+                        }
+                        details.push(Line::from(""));
+                    }
+                }
+                crate::preferences::McpServerConfig::Sse { url } => {
+                    details.push(Line::from(vec![
+                        Span::styled("Type: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::styled("remote (SSE)", Style::default().fg(Color::Blue)),
+                    ]));
+                    details.push(Line::from(""));
+
+                    details.push(Line::from(vec![
+                        Span::styled("URL: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(url),
+                    ]));
+                }
+            }
+
+            details.push(Line::from(""));
+            details.push(Line::from(vec![Span::styled(
+                "Syncs to: Claude, Gemini, OpenCode",
+                Style::default().fg(Color::DarkGray),
+            )]));
+        }
+    } else {
+        details.push(Line::from(""));
+        details.push(Line::from("No MCP servers configured."));
+        details.push(Line::from(""));
+        details.push(Line::from(vec![Span::styled(
+            "Press [a] to add a new server, or [m] for default servers.",
+            Style::default().fg(Color::DarkGray),
+        )]));
+    }
+
+    let details_block = Block::default().borders(Borders::ALL).title("Details");
+    f.render_widget(Paragraph::new(details).block(details_block), main_chunks[1]);
+
+    if let Some((msg, _)) = &app.status_message {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                msg,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            chunks[3],
+        );
+    }
+
+    let hints = Line::from(vec![
+        Span::styled("[j/k]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Navigate | "),
+        Span::styled("[a]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Add | "),
+        Span::styled("[e/Enter]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Edit | "),
+        Span::styled("[d]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Delete | "),
+        Span::styled("[m]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Magic | "),
+        Span::styled("[s]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Sync All | "),
+        Span::styled("[q]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Quit"),
+    ]);
+    f.render_widget(Paragraph::new(hints), chunks[4]);
+}
+
+fn render_mcp_edit_dialog(f: &mut Frame, app: &App) {
+    let area = f.area();
+
+    let width = 80;
+    let height = 20;
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)) / 2;
+
+    let dialog_area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, dialog_area);
+
+    let title = if app.mcp_editor_state.is_new {
+        "Add MCP Server"
+    } else {
+        "Edit MCP Server"
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .style(Style::default().bg(Color::Black));
+
+    f.render_widget(block, dialog_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(3), // Name
+            Constraint::Length(3), // Command
+            Constraint::Length(3), // Args
+            Constraint::Min(3),    // Env
+            Constraint::Length(2), // Help
+        ])
+        .split(dialog_area);
+
+    let draw_input = |f: &mut Frame,
+                      title: &str,
+                      content: &str,
+                      focus: McpFieldFocus,
+                      target: McpFieldFocus,
+                      area: Rect| {
+        let style = if focus == target {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(style);
+
+        let text = if focus == target {
+            format!("{}_", content)
+        } else {
+            content.to_string()
+        };
+
+        f.render_widget(Paragraph::new(text).block(block), area);
+    };
+
+    draw_input(
+        f,
+        "Name (Unique ID)",
+        &app.mcp_editor_state.editing_name,
+        app.mcp_editor_state.focus,
+        McpFieldFocus::Name,
+        chunks[0],
+    );
+    draw_input(
+        f,
+        "Command / URL (for SSE)",
+        &app.mcp_editor_state.editing_command,
+        app.mcp_editor_state.focus,
+        McpFieldFocus::Command,
+        chunks[1],
+    );
+    draw_input(
+        f,
+        "Args (Space separated - Stdio only)",
+        &app.mcp_editor_state.editing_args,
+        app.mcp_editor_state.focus,
+        McpFieldFocus::Args,
+        chunks[2],
+    );
+    draw_input(
+        f,
+        "Env (KEY=VAL,KEY=VAL - Stdio only)",
+        &app.mcp_editor_state.editing_env,
+        app.mcp_editor_state.focus,
+        McpFieldFocus::Env,
+        chunks[3],
+    );
+
+    let help = Line::from(vec![
+        Span::styled("[Tab]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Next Field | "),
+        Span::styled("[Enter]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Save | "),
+        Span::styled("[Esc]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Cancel | "),
+        Span::styled("Note:", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" URLs starting with http(s):// use SSE transport"),
+    ]);
+    f.render_widget(Paragraph::new(help), chunks[4]);
 }

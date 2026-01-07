@@ -1,3 +1,4 @@
+use crate::preferences::PreferenceManager;
 use anyhow::{Context, Result};
 use chrono::Local;
 use directories::ProjectDirs;
@@ -12,6 +13,7 @@ pub struct ConfigPaths {
     pub global_rules_primary: PathBuf,
     pub backup_dir: PathBuf,
     pub project_id: String,
+    pub preferences: PreferenceManager,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -69,7 +71,7 @@ impl ConfigPaths {
 
         let cwd = std::env::current_dir()?;
         let config_file = cwd.join(".mooagent.toml");
-        
+
         let project_id = cwd
             .file_name()
             .and_then(|n| n.to_str())
@@ -125,6 +127,10 @@ impl ConfigPaths {
             });
         }
 
+        let mut preferences = PreferenceManager::new(global_config_dir);
+        let _ = preferences.load_global();
+        let _ = preferences.load_project(&config_file);
+
         Ok(Self {
             project_agents: cwd.join("AGENTS.md"),
             config_file,
@@ -132,6 +138,7 @@ impl ConfigPaths {
             global_rules_primary: global_config_dir.join("GLOBAL_RULES.md"),
             backup_dir,
             project_id,
+            preferences,
         })
     }
 
@@ -155,13 +162,15 @@ impl ConfigPaths {
 
     pub fn sync_global_rules(&self) -> Result<()> {
         log::info!("Syncing global rules to all agent files");
-        
-        let primary_content = if self.global_rules_primary.exists() {
-            fs::read_to_string(&self.global_rules_primary)?
-        } else {
-            String::new()
-        };
-        
+
+        if !self.global_rules_primary.exists() {
+            anyhow::bail!(
+                "Primary global rules file does not exist: {}",
+                self.global_rules_primary.display()
+            );
+        }
+        let primary_content = fs::read_to_string(&self.global_rules_primary)?;
+
         for agent_def in &self.agent_configs {
             if let Some(global_file) = &agent_def.global_file {
                 let needs_sync = if global_file.exists() {
@@ -171,6 +180,7 @@ impl ConfigPaths {
                 };
 
                 if needs_sync {
+                    self.backup_if_needed(global_file)?;
                     fs::write(global_file, &primary_content)?;
                     log::info!("Synced global rules to {}", global_file.display());
                 }
@@ -318,6 +328,95 @@ impl ConfigPaths {
         Ok(format!("Successfully synced {}", agent.name))
     }
 
+    pub fn sync_preferences(&self) -> Result<String> {
+        let merged_prefs = self.preferences.get_merged();
+        let home = dirs::home_dir().context("Could not determine home directory")?;
+
+        let generators: Vec<Box<dyn crate::preferences::ConfigGenerator>> = vec![
+            Box::new(crate::preferences::ClaudeConfigGenerator {
+                config_dir: home.join(".claude"),
+                user_config_path: home.join(".claude.json"),
+            }),
+            Box::new(crate::preferences::GeminiConfigGenerator {
+                config_dir: home.join(".gemini"),
+            }),
+            Box::new(crate::preferences::OpenCodeConfigGenerator {
+                config_dir: home.join(".config/opencode"),
+            }),
+        ];
+
+        let mut synced_count = 0;
+
+        for generator in generators {
+            let files = generator.generate(&merged_prefs)?;
+            for (path, content) in files {
+                let needs_sync = if path.exists() {
+                    fs::read_to_string(&path).unwrap_or_default() != content
+                } else {
+                    true
+                };
+
+                if needs_sync {
+                    self.backup_if_needed(&path)?;
+
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+
+                    fs::write(&path, &content)?;
+                    synced_count += 1;
+                    log::info!(
+                        "[{}] Synced config to {}",
+                        generator.agent_name(),
+                        path.display()
+                    );
+                }
+            }
+        }
+
+        if synced_count == 0 {
+            Ok("Preferences already in sync.".to_string())
+        } else {
+            Ok(format!("Synced {} preference files.", synced_count))
+        }
+    }
+
+    pub fn check_preference_drift(&self) -> bool {
+        let merged_prefs = self.preferences.get_merged();
+        let home = match dirs::home_dir() {
+            Some(h) => h,
+            None => return false,
+        };
+
+        let generators: Vec<Box<dyn crate::preferences::ConfigGenerator>> = vec![
+            Box::new(crate::preferences::ClaudeConfigGenerator {
+                config_dir: home.join(".claude"),
+                user_config_path: home.join(".claude.json"),
+            }),
+            Box::new(crate::preferences::GeminiConfigGenerator {
+                config_dir: home.join(".gemini"),
+            }),
+            Box::new(crate::preferences::OpenCodeConfigGenerator {
+                config_dir: home.join(".config/opencode"),
+            }),
+        ];
+
+        for generator in generators {
+            if let Ok(files) = generator.generate(&merged_prefs) {
+                for (path, content) in files {
+                    if path.exists() {
+                        if fs::read_to_string(&path).unwrap_or_default() != content {
+                            return true;
+                        }
+                    } else {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn backup_if_needed(&self, target_path: &Path) -> Result<()> {
         if target_path.exists() {
             let timestamp = Local::now().format("%Y%m%d_%H%M%S");
@@ -325,16 +424,16 @@ impl ConfigPaths {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown");
-            
+
             let is_global = target_path.starts_with(dirs::home_dir().unwrap_or_default())
                 && target_path != self.project_agents;
-            
+
             let backup_name = if is_global {
                 format!("global_{}.{}", filename, timestamp)
             } else {
                 format!("{}_{}.{}", self.project_id, filename, timestamp)
             };
-            
+
             let backup = self.backup_dir.join(backup_name);
             fs::copy(target_path, &backup)?;
             log::info!("Created backup: {}", backup.display());
@@ -355,9 +454,11 @@ impl ConfigPaths {
             .and_then(|n| n.to_str())
             .unwrap_or("");
 
-        let is_global = agent.target_path.starts_with(dirs::home_dir().unwrap_or_default())
+        let is_global = agent
+            .target_path
+            .starts_with(dirs::home_dir().unwrap_or_default())
             && agent.target_path != self.project_agents;
-        
+
         let prefix = if is_global {
             format!("global_{}", filename)
         } else {

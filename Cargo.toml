@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
-chrono = "0.4.42"
+chrono = { version = "0.4.42", features = ["serde"] }
 crossterm = "0.29.0"
 directories = "6.0.0"
 dirs = "5.0.1"
@@ -21,6 +21,16 @@ shellexpand = "3.1.0"
 syntect = "5.2"
 pulldown-cmark = "0.11"
 serde_json = "1.0.148"
+
+# OAuth dependencies
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
+oauth2 = "5"
+open = "5"
+base64 = "0.22"
+rand = "0.8"
+sha2 = "0.10"
+url = "2"
 
 [dev-dependencies]
 tempfile = "3.10"

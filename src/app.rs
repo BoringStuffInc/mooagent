@@ -1,5 +1,6 @@
 use crate::config::{AgentInfo, ConfigPaths};
-use crate::preferences::McpServerConfig;
+use crate::credentials::{CredentialManager, TokenStatus};
+use crate::preferences::{McpAuth, McpServerConfig};
 use anyhow::Result;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -47,12 +48,44 @@ pub struct PreferenceEditorState {
     pub individual_tool_list: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum McpAuthType {
+    #[default]
+    None,
+    Bearer,
+    OAuth,
+}
+
+impl McpAuthType {
+    pub fn next(self) -> Self {
+        match self {
+            Self::None => Self::Bearer,
+            Self::Bearer => Self::OAuth,
+            Self::OAuth => Self::None,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::None => Self::OAuth,
+            Self::Bearer => Self::None,
+            Self::OAuth => Self::Bearer,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpFieldFocus {
     Name,
     Command,
     Args,
     Env,
+    AuthType,
+    BearerToken,
+    OAuthClientId,
+    OAuthClientSecret,
+    OAuthScopes,
+    OAuthAuthServerUrl,
 }
 
 pub struct McpEditorState {
@@ -65,6 +98,13 @@ pub struct McpEditorState {
     pub editing_args: String,
     pub editing_env: String,
     pub focus: McpFieldFocus,
+
+    pub editing_auth_type: McpAuthType,
+    pub editing_bearer_token: String,
+    pub editing_oauth_client_id: String,
+    pub editing_oauth_client_secret: String,
+    pub editing_oauth_scopes: String,
+    pub editing_oauth_auth_server_url: String,
 }
 
 impl Default for PreferenceEditorState {
@@ -115,8 +155,38 @@ impl Default for McpEditorState {
             editing_args: String::new(),
             editing_env: String::new(),
             focus: McpFieldFocus::Name,
+            editing_auth_type: McpAuthType::None,
+            editing_bearer_token: String::new(),
+            editing_oauth_client_id: String::new(),
+            editing_oauth_client_secret: String::new(),
+            editing_oauth_scopes: String::new(),
+            editing_oauth_auth_server_url: String::new(),
         }
     }
+}
+
+impl McpEditorState {
+    pub fn clear_auth_fields(&mut self) {
+        self.editing_auth_type = McpAuthType::None;
+        self.editing_bearer_token.clear();
+        self.editing_oauth_client_id.clear();
+        self.editing_oauth_client_secret.clear();
+        self.editing_oauth_scopes.clear();
+        self.editing_oauth_auth_server_url.clear();
+    }
+
+    pub fn is_remote_server(&self) -> bool {
+        let cmd = self.editing_command.trim();
+        cmd.starts_with("http://") || cmd.starts_with("https://")
+    }
+}
+
+pub struct OAuthFlowConfig {
+    pub server_url: String,
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub scopes: Vec<String>,
+    pub auth_server_url: Option<String>,
 }
 
 pub struct App {
@@ -144,6 +214,7 @@ pub struct App {
     pub mcp_editor_state: McpEditorState,
     pub new_tool_input: String,
     pub should_quit: bool,
+    pub credentials: CredentialManager,
 }
 
 impl App {
@@ -154,6 +225,9 @@ impl App {
         let agents = paths.get_agents();
 
         let filtered_agents: Vec<usize> = (0..agents.len()).collect();
+
+        let mut credentials = CredentialManager::new(&paths.config_dir);
+        let _ = credentials.load();
 
         let mut app = Self {
             paths,
@@ -180,6 +254,7 @@ impl App {
             mcp_editor_state: McpEditorState::default(),
             new_tool_input: String::new(),
             should_quit: false,
+            credentials,
         };
 
         app.update_mcp_list();
@@ -247,6 +322,7 @@ impl App {
         self.mcp_editor_state.editing_command.clear();
         self.mcp_editor_state.editing_args.clear();
         self.mcp_editor_state.editing_env.clear();
+        self.mcp_editor_state.clear_auth_fields();
         self.mcp_editor_state.focus = McpFieldFocus::Name;
         self.mode = AppMode::EditMcp;
     }
@@ -257,35 +333,73 @@ impl App {
         }
 
         let server_name =
-            &self.mcp_editor_state.server_list[self.mcp_editor_state.selected_server_idx];
+            self.mcp_editor_state.server_list[self.mcp_editor_state.selected_server_idx].clone();
 
-        if let Some(config) = self
+        let Some(config) = self
             .paths
             .preferences
             .global_prefs
             .mcp_servers
-            .get(server_name)
-        {
-            self.mcp_editor_state.is_new = false;
-            self.mcp_editor_state.editing_name = server_name.clone();
-            match config {
-                McpServerConfig::Stdio { command, args, env } => {
-                    self.mcp_editor_state.editing_command = command.clone();
-                    self.mcp_editor_state.editing_args = args.join(" ");
-                    self.mcp_editor_state.editing_env = env
-                        .iter()
-                        .map(|(k, v)| format!("{}={}", k, v))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                }
-                McpServerConfig::Sse { url } => {
-                    self.mcp_editor_state.editing_command = url.clone();
-                    self.mcp_editor_state.editing_args.clear();
-                    self.mcp_editor_state.editing_env.clear();
-                }
+            .get(&server_name)
+            .cloned()
+        else {
+            return;
+        };
+
+        self.mcp_editor_state.is_new = false;
+        self.mcp_editor_state.editing_name = server_name;
+        self.mcp_editor_state.clear_auth_fields();
+
+        match &config {
+            McpServerConfig::Stdio { command, args, env } => {
+                self.mcp_editor_state.editing_command = command.clone();
+                self.mcp_editor_state.editing_args = args.join(" ");
+                self.mcp_editor_state.editing_env = env
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(",");
             }
-            self.mcp_editor_state.focus = McpFieldFocus::Command;
-            self.mode = AppMode::EditMcp;
+            McpServerConfig::Sse { url, auth } => {
+                self.mcp_editor_state.editing_command = url.clone();
+                self.mcp_editor_state.editing_args.clear();
+                self.mcp_editor_state.editing_env.clear();
+                self.populate_auth_fields(auth);
+            }
+            McpServerConfig::Http { http_url, auth } => {
+                self.mcp_editor_state.editing_command = http_url.clone();
+                self.mcp_editor_state.editing_args.clear();
+                self.mcp_editor_state.editing_env.clear();
+                self.populate_auth_fields(auth);
+            }
+        }
+        self.mcp_editor_state.focus = McpFieldFocus::Command;
+        self.mode = AppMode::EditMcp;
+    }
+
+    fn populate_auth_fields(&mut self, auth: &McpAuth) {
+        match auth {
+            McpAuth::None => {
+                self.mcp_editor_state.editing_auth_type = McpAuthType::None;
+            }
+            McpAuth::Bearer { token } => {
+                self.mcp_editor_state.editing_auth_type = McpAuthType::Bearer;
+                self.mcp_editor_state.editing_bearer_token = token.clone();
+            }
+            McpAuth::OAuth {
+                client_id,
+                client_secret,
+                auth_server_url,
+                scopes,
+            } => {
+                self.mcp_editor_state.editing_auth_type = McpAuthType::OAuth;
+                self.mcp_editor_state.editing_oauth_client_id = client_id.clone();
+                self.mcp_editor_state.editing_oauth_client_secret =
+                    client_secret.clone().unwrap_or_default();
+                self.mcp_editor_state.editing_oauth_auth_server_url =
+                    auth_server_url.clone().unwrap_or_default();
+                self.mcp_editor_state.editing_oauth_scopes = scopes.join(" ");
+            }
         }
     }
 
@@ -329,7 +443,30 @@ impl App {
         }
 
         let config = if command.starts_with("http://") || command.starts_with("https://") {
-            McpServerConfig::Sse { url: command }
+            let auth = self.build_auth_config();
+            let requires_oauth = auth.requires_oauth();
+
+            let config = McpServerConfig::Sse { url: command, auth };
+
+            self.paths
+                .preferences
+                .global_prefs
+                .mcp_servers
+                .insert(name.clone(), config);
+
+            let _ = self.paths.preferences.save_global();
+            self.update_mcp_list();
+            self.mode = AppMode::Normal;
+
+            if requires_oauth {
+                self.set_status(format!(
+                    "Saved MCP server: {} - Press 'o' to authenticate",
+                    name
+                ));
+            } else {
+                self.set_status(format!("Saved MCP server: {} (syncs to all agents)", name));
+            }
+            return;
         } else {
             McpServerConfig::Stdio { command, args, env }
         };
@@ -344,6 +481,58 @@ impl App {
         self.update_mcp_list();
         self.mode = AppMode::Normal;
         self.set_status(format!("Saved MCP server: {} (syncs to all agents)", name));
+    }
+
+    fn build_auth_config(&self) -> McpAuth {
+        match self.mcp_editor_state.editing_auth_type {
+            McpAuthType::None => McpAuth::None,
+            McpAuthType::Bearer => {
+                let token = self.mcp_editor_state.editing_bearer_token.trim();
+                if token.is_empty() {
+                    McpAuth::None
+                } else {
+                    McpAuth::Bearer {
+                        token: token.to_string(),
+                    }
+                }
+            }
+            McpAuthType::OAuth => {
+                let client_id = self.mcp_editor_state.editing_oauth_client_id.trim();
+                if client_id.is_empty() {
+                    McpAuth::None
+                } else {
+                    let client_secret = {
+                        let s = self.mcp_editor_state.editing_oauth_client_secret.trim();
+                        if s.is_empty() {
+                            None
+                        } else {
+                            Some(s.to_string())
+                        }
+                    };
+                    let auth_server_url = {
+                        let s = self.mcp_editor_state.editing_oauth_auth_server_url.trim();
+                        if s.is_empty() {
+                            None
+                        } else {
+                            Some(s.to_string())
+                        }
+                    };
+                    let scopes: Vec<String> = self
+                        .mcp_editor_state
+                        .editing_oauth_scopes
+                        .split_whitespace()
+                        .map(String::from)
+                        .collect();
+
+                    McpAuth::OAuth {
+                        client_id: client_id.to_string(),
+                        client_secret,
+                        auth_server_url,
+                        scopes,
+                    }
+                }
+            }
+        }
     }
 
     pub fn magic_mcp_setup(&mut self) {
@@ -396,12 +585,41 @@ impl App {
     }
 
     pub fn mcp_next_field(&mut self) {
+        let is_remote = self.mcp_editor_state.is_remote_server();
+        let auth_type = self.mcp_editor_state.editing_auth_type;
+
         self.mcp_editor_state.focus = match self.mcp_editor_state.focus {
             McpFieldFocus::Name => McpFieldFocus::Command,
-            McpFieldFocus::Command => McpFieldFocus::Args,
+            McpFieldFocus::Command => {
+                if is_remote {
+                    McpFieldFocus::AuthType
+                } else {
+                    McpFieldFocus::Args
+                }
+            }
             McpFieldFocus::Args => McpFieldFocus::Env,
             McpFieldFocus::Env => McpFieldFocus::Name,
+            McpFieldFocus::AuthType => match auth_type {
+                McpAuthType::None => McpFieldFocus::Name,
+                McpAuthType::Bearer => McpFieldFocus::BearerToken,
+                McpAuthType::OAuth => McpFieldFocus::OAuthClientId,
+            },
+            McpFieldFocus::BearerToken => McpFieldFocus::Name,
+            McpFieldFocus::OAuthClientId => McpFieldFocus::OAuthClientSecret,
+            McpFieldFocus::OAuthClientSecret => McpFieldFocus::OAuthScopes,
+            McpFieldFocus::OAuthScopes => McpFieldFocus::OAuthAuthServerUrl,
+            McpFieldFocus::OAuthAuthServerUrl => McpFieldFocus::Name,
         };
+    }
+
+    pub fn mcp_cycle_auth_type(&mut self, forward: bool) {
+        if self.mcp_editor_state.focus == McpFieldFocus::AuthType {
+            self.mcp_editor_state.editing_auth_type = if forward {
+                self.mcp_editor_state.editing_auth_type.next()
+            } else {
+                self.mcp_editor_state.editing_auth_type.prev()
+            };
+        }
     }
 
     pub fn mcp_input_char(&mut self, c: char) {
@@ -414,6 +632,28 @@ impl App {
             McpFieldFocus::Command => self.mcp_editor_state.editing_command.push(c),
             McpFieldFocus::Args => self.mcp_editor_state.editing_args.push(c),
             McpFieldFocus::Env => self.mcp_editor_state.editing_env.push(c),
+            McpFieldFocus::AuthType => {
+                if c == ' ' || c == 'l' || c == 'j' {
+                    self.mcp_cycle_auth_type(true);
+                } else if c == 'h' || c == 'k' {
+                    self.mcp_cycle_auth_type(false);
+                }
+            }
+            McpFieldFocus::BearerToken => {
+                self.mcp_editor_state.editing_bearer_token.push(c);
+            }
+            McpFieldFocus::OAuthClientId => {
+                self.mcp_editor_state.editing_oauth_client_id.push(c);
+            }
+            McpFieldFocus::OAuthClientSecret => {
+                self.mcp_editor_state.editing_oauth_client_secret.push(c);
+            }
+            McpFieldFocus::OAuthScopes => {
+                self.mcp_editor_state.editing_oauth_scopes.push(c);
+            }
+            McpFieldFocus::OAuthAuthServerUrl => {
+                self.mcp_editor_state.editing_oauth_auth_server_url.push(c);
+            }
         }
     }
 
@@ -432,6 +672,22 @@ impl App {
             }
             McpFieldFocus::Env => {
                 let _ = self.mcp_editor_state.editing_env.pop();
+            }
+            McpFieldFocus::AuthType => {}
+            McpFieldFocus::BearerToken => {
+                let _ = self.mcp_editor_state.editing_bearer_token.pop();
+            }
+            McpFieldFocus::OAuthClientId => {
+                let _ = self.mcp_editor_state.editing_oauth_client_id.pop();
+            }
+            McpFieldFocus::OAuthClientSecret => {
+                let _ = self.mcp_editor_state.editing_oauth_client_secret.pop();
+            }
+            McpFieldFocus::OAuthScopes => {
+                let _ = self.mcp_editor_state.editing_oauth_scopes.pop();
+            }
+            McpFieldFocus::OAuthAuthServerUrl => {
+                let _ = self.mcp_editor_state.editing_oauth_auth_server_url.pop();
             }
         }
     }
@@ -894,5 +1150,139 @@ impl App {
     pub fn cancel_add_tool(&mut self) {
         self.new_tool_input.clear();
         self.mode = AppMode::Normal;
+    }
+
+    pub fn get_selected_mcp_oauth_status(&self) -> Option<(TokenStatus, Option<String>)> {
+        if self.mcp_editor_state.server_list.is_empty() {
+            return None;
+        }
+
+        let server_name =
+            &self.mcp_editor_state.server_list[self.mcp_editor_state.selected_server_idx];
+
+        let config = self
+            .paths
+            .preferences
+            .global_prefs
+            .mcp_servers
+            .get(server_name)?;
+
+        let url = match config {
+            McpServerConfig::Sse {
+                url,
+                auth: McpAuth::OAuth { .. },
+            } => url,
+            McpServerConfig::Http {
+                http_url,
+                auth: McpAuth::OAuth { .. },
+            } => http_url,
+            _ => return None,
+        };
+
+        let status = self.credentials.token_status(url);
+        Some((status, Some(url.clone())))
+    }
+
+    pub fn mcp_requires_oauth(&self) -> bool {
+        if self.mcp_editor_state.server_list.is_empty() {
+            return false;
+        }
+
+        let server_name =
+            &self.mcp_editor_state.server_list[self.mcp_editor_state.selected_server_idx];
+
+        self.paths
+            .preferences
+            .global_prefs
+            .mcp_servers
+            .get(server_name)
+            .map(|c| c.requires_oauth())
+            .unwrap_or(false)
+    }
+
+    pub fn mcp_oauth_logout(&mut self) {
+        let Some((_, Some(url))) = self.get_selected_mcp_oauth_status() else {
+            self.set_status("Selected server does not use OAuth".to_string());
+            return;
+        };
+
+        match self.credentials.remove_token(&url) {
+            Ok(Some(_)) => {
+                self.set_status(
+                    "OAuth token removed. Run sync to update agent configs.".to_string(),
+                );
+            }
+            Ok(None) => {
+                self.set_status("No OAuth token stored for this server".to_string());
+            }
+            Err(e) => {
+                self.set_status(format!("Failed to remove token: {}", e));
+            }
+        }
+    }
+
+    pub fn get_mcp_oauth_config(&self) -> Option<OAuthFlowConfig> {
+        if self.mcp_editor_state.server_list.is_empty() {
+            return None;
+        }
+
+        let server_name =
+            &self.mcp_editor_state.server_list[self.mcp_editor_state.selected_server_idx];
+
+        let config = self
+            .paths
+            .preferences
+            .global_prefs
+            .mcp_servers
+            .get(server_name)?;
+
+        match config {
+            McpServerConfig::Sse {
+                url,
+                auth:
+                    McpAuth::OAuth {
+                        client_id,
+                        client_secret,
+                        scopes,
+                        auth_server_url,
+                    },
+            } => Some(OAuthFlowConfig {
+                server_url: url.clone(),
+                client_id: client_id.clone(),
+                client_secret: client_secret.clone(),
+                scopes: scopes.clone(),
+                auth_server_url: auth_server_url.clone(),
+            }),
+            McpServerConfig::Http {
+                http_url,
+                auth:
+                    McpAuth::OAuth {
+                        client_id,
+                        client_secret,
+                        scopes,
+                        auth_server_url,
+                    },
+            } => Some(OAuthFlowConfig {
+                server_url: http_url.clone(),
+                client_id: client_id.clone(),
+                client_secret: client_secret.clone(),
+                scopes: scopes.clone(),
+                auth_server_url: auth_server_url.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn store_oauth_token(&mut self, url: &str, token: crate::credentials::StoredToken) {
+        match self.credentials.store_token(url, token) {
+            Ok(()) => {
+                self.set_status(
+                    "OAuth login successful! Run sync to update agent configs.".to_string(),
+                );
+            }
+            Err(e) => {
+                self.set_status(format!("Failed to store token: {}", e));
+            }
+        }
     }
 }

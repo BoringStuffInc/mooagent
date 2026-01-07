@@ -1,3 +1,4 @@
+use crate::credentials::CredentialManager;
 use crate::preferences::PreferenceManager;
 use anyhow::{Context, Result};
 use chrono::Local;
@@ -14,6 +15,7 @@ pub struct ConfigPaths {
     pub backup_dir: PathBuf,
     pub project_id: String,
     pub preferences: PreferenceManager,
+    pub config_dir: PathBuf,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -139,6 +141,7 @@ impl ConfigPaths {
             backup_dir,
             project_id,
             preferences,
+            config_dir: global_config_dir.to_path_buf(),
         })
     }
 
@@ -332,6 +335,9 @@ impl ConfigPaths {
         let merged_prefs = self.preferences.get_merged();
         let home = dirs::home_dir().context("Could not determine home directory")?;
 
+        let mut credentials = CredentialManager::new(&self.config_dir);
+        let _ = credentials.load();
+
         let generators: Vec<Box<dyn crate::preferences::ConfigGenerator>> = vec![
             Box::new(crate::preferences::ClaudeConfigGenerator {
                 config_dir: home.join(".claude"),
@@ -348,7 +354,7 @@ impl ConfigPaths {
         let mut synced_count = 0;
 
         for generator in generators {
-            let files = generator.generate(&merged_prefs)?;
+            let files = generator.generate(&merged_prefs, Some(&credentials))?;
             for (path, content) in files {
                 let needs_sync = if path.exists() {
                     fs::read_to_string(&path).unwrap_or_default() != content
@@ -388,6 +394,9 @@ impl ConfigPaths {
             None => return false,
         };
 
+        let mut credentials = CredentialManager::new(&self.config_dir);
+        let _ = credentials.load();
+
         let generators: Vec<Box<dyn crate::preferences::ConfigGenerator>> = vec![
             Box::new(crate::preferences::ClaudeConfigGenerator {
                 config_dir: home.join(".claude"),
@@ -402,7 +411,7 @@ impl ConfigPaths {
         ];
 
         for generator in generators {
-            if let Ok(files) = generator.generate(&merged_prefs) {
+            if let Ok(files) = generator.generate(&merged_prefs, Some(&credentials)) {
                 for (path, content) in files {
                     if path.exists() {
                         if fs::read_to_string(&path).unwrap_or_default() != content {

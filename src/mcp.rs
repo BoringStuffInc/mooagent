@@ -1,5 +1,7 @@
 use crate::config::ConfigPaths;
-use crate::preferences::McpServerConfig;
+use crate::credentials::{CredentialManager, TokenStatus};
+use crate::oauth;
+use crate::preferences::{McpAuth, McpServerConfig};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -160,6 +162,92 @@ fn handle_request(request: &JsonRpcRequest) -> Option<JsonRpcResponse> {
     }
 }
 
+fn parse_auth_config(arguments: &Value) -> McpAuth {
+    let auth_obj = match arguments.get("auth") {
+        Some(v) if v.is_object() => v,
+        _ => return McpAuth::None,
+    };
+
+    let auth_type = auth_obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    match auth_type {
+        "bearer" => {
+            if let Some(token) = auth_obj.get("token").and_then(|v| v.as_str()) {
+                McpAuth::Bearer {
+                    token: token.to_string(),
+                }
+            } else {
+                McpAuth::None
+            }
+        }
+        "oauth" => {
+            if let Some(client_id) = auth_obj.get("client_id").and_then(|v| v.as_str()) {
+                let client_secret = auth_obj
+                    .get("client_secret")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let auth_server_url = auth_obj
+                    .get("auth_server_url")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let scopes = auth_obj
+                    .get("scopes")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                McpAuth::OAuth {
+                    client_id: client_id.to_string(),
+                    client_secret,
+                    auth_server_url,
+                    scopes,
+                }
+            } else {
+                McpAuth::None
+            }
+        }
+        _ => McpAuth::None,
+    }
+}
+
+fn format_auth_status(
+    result: &mut String,
+    url: &str,
+    auth: &McpAuth,
+    credentials: &CredentialManager,
+) {
+    match auth {
+        McpAuth::None => {}
+        McpAuth::Bearer { .. } => {
+            result.push_str("  Auth: Bearer token (static)\n");
+        }
+        McpAuth::OAuth {
+            client_id, scopes, ..
+        } => {
+            let status = credentials.token_status(url);
+            let status_icon = match status {
+                TokenStatus::Valid => "✅",
+                TokenStatus::ExpiresSoon => "⚠️",
+                TokenStatus::Expired => "❌",
+                TokenStatus::None => "🔒",
+            };
+            result.push_str(&format!(
+                "  Auth: OAuth {} ({})\n",
+                status_icon,
+                status.description()
+            ));
+            result.push_str(&format!("  Client ID: {}\n", client_id));
+            if !scopes.is_empty() {
+                result.push_str(&format!("  Scopes: {}\n", scopes.join(" ")));
+            }
+        }
+    }
+}
+
 fn get_tools_list() -> Vec<Value> {
     vec![
         json!({
@@ -193,6 +281,38 @@ fn get_tools_list() -> Vec<Value> {
                     "env": {
                         "type": "object",
                         "description": "Environment variables (only for local servers)"
+                    },
+                    "auth": {
+                        "type": "object",
+                        "description": "Authentication configuration for remote servers",
+                        "properties": {
+                            "type": {
+                                "type": "string",
+                                "enum": ["bearer", "oauth"],
+                                "description": "Authentication type"
+                            },
+                            "token": {
+                                "type": "string",
+                                "description": "Bearer token (for type=bearer)"
+                            },
+                            "client_id": {
+                                "type": "string",
+                                "description": "OAuth client ID (for type=oauth)"
+                            },
+                            "client_secret": {
+                                "type": "string",
+                                "description": "OAuth client secret (optional, for type=oauth)"
+                            },
+                            "scopes": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "OAuth scopes (optional, for type=oauth)"
+                            },
+                            "auth_server_url": {
+                                "type": "string",
+                                "description": "OAuth authorization server URL (optional, auto-discovered if not provided)"
+                            }
+                        }
                     }
                 },
                 "required": ["name", "command"]
@@ -285,6 +405,48 @@ fn get_tools_list() -> Vec<Value> {
                 "required": []
             }
         }),
+        json!({
+            "name": "oauth_status",
+            "description": "Get OAuth authentication status for an MCP server.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the MCP server to check"
+                    }
+                },
+                "required": ["name"]
+            }
+        }),
+        json!({
+            "name": "oauth_login",
+            "description": "Initiate OAuth login flow for an MCP server. Opens browser for authentication.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the MCP server to authenticate"
+                    }
+                },
+                "required": ["name"]
+            }
+        }),
+        json!({
+            "name": "oauth_logout",
+            "description": "Remove stored OAuth token for an MCP server.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the MCP server to logout from"
+                    }
+                },
+                "required": ["name"]
+            }
+        }),
     ]
 }
 
@@ -297,6 +459,9 @@ fn call_tool(name: &str, arguments: Value) -> Result<String> {
             if servers.is_empty() {
                 return Ok("No MCP servers configured.".to_string());
             }
+
+            let mut credentials = CredentialManager::new(&paths.config_dir);
+            let _ = credentials.load();
 
             let mut result = String::from("Configured MCP servers:\n\n");
             for (name, config) in servers {
@@ -315,9 +480,15 @@ fn call_tool(name: &str, arguments: Value) -> Result<String> {
                             }
                         }
                     }
-                    McpServerConfig::Sse { url } => {
+                    McpServerConfig::Sse { url, auth } => {
                         result.push_str("  Type: remote (SSE)\n");
                         result.push_str(&format!("  URL: {}\n", url));
+                        format_auth_status(&mut result, url, auth, &credentials);
+                    }
+                    McpServerConfig::Http { http_url, auth } => {
+                        result.push_str("  Type: remote (HTTP)\n");
+                        result.push_str(&format!("  URL: {}\n", http_url));
+                        format_auth_status(&mut result, http_url, auth, &credentials);
                     }
                 }
                 result.push('\n');
@@ -338,8 +509,10 @@ fn call_tool(name: &str, arguments: Value) -> Result<String> {
             let mut paths = paths;
 
             let config = if command.starts_with("http://") || command.starts_with("https://") {
+                let auth = parse_auth_config(&arguments);
                 McpServerConfig::Sse {
                     url: command.to_string(),
+                    auth,
                 }
             } else {
                 let args: Vec<String> = arguments
@@ -369,6 +542,8 @@ fn call_tool(name: &str, arguments: Value) -> Result<String> {
                 }
             };
 
+            let has_oauth = config.requires_oauth();
+
             paths
                 .preferences
                 .global_prefs
@@ -376,10 +551,17 @@ fn call_tool(name: &str, arguments: Value) -> Result<String> {
                 .insert(name.to_string(), config);
             paths.preferences.save_global()?;
 
-            Ok(format!(
-                "Added MCP server '{}'. Run 'sync' to apply to all agents.",
-                name
-            ))
+            if has_oauth {
+                Ok(format!(
+                    "Added MCP server '{}' with OAuth. Run 'oauth_login' to authenticate, then 'sync' to apply.",
+                    name
+                ))
+            } else {
+                Ok(format!(
+                    "Added MCP server '{}'. Run 'sync' to apply to all agents.",
+                    name
+                ))
+            }
         }
 
         "mcp_remove" => {
@@ -572,7 +754,8 @@ fn call_tool(name: &str, arguments: Value) -> Result<String> {
                      - mcp_list, mcp_add, mcp_remove\n\
                      - edit_global_rules, edit_project_rules\n\
                      - read_global_rules, read_project_rules\n\
-                     - sync, get_status, bootstrap",
+                     - sync, get_status, bootstrap\n\
+                     - oauth_status, oauth_login, oauth_logout",
                     mooagent_path.display()
                 )),
                 (Err(e), _) => Err(anyhow::anyhow!(
@@ -583,6 +766,165 @@ fn call_tool(name: &str, arguments: Value) -> Result<String> {
                     "Bootstrap added config but prefs sync failed: {}",
                     e
                 )),
+            }
+        }
+
+        "oauth_status" => {
+            let name = arguments
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'name' argument"))?;
+
+            let server = paths
+                .preferences
+                .global_prefs
+                .mcp_servers
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found", name))?;
+
+            let (url, auth) = match server {
+                McpServerConfig::Sse { url, auth } => (url.as_str(), auth),
+                McpServerConfig::Http { http_url, auth } => (http_url.as_str(), auth),
+                McpServerConfig::Stdio { .. } => {
+                    return Ok(format!(
+                        "MCP server '{}' is a local (stdio) server - OAuth not applicable.",
+                        name
+                    ));
+                }
+            };
+
+            match auth {
+                McpAuth::None => Ok(format!(
+                    "MCP server '{}' has no authentication configured.",
+                    name
+                )),
+                McpAuth::Bearer { .. } => {
+                    Ok(format!("MCP server '{}' uses a static bearer token.", name))
+                }
+                McpAuth::OAuth {
+                    client_id, scopes, ..
+                } => {
+                    let mut credentials = CredentialManager::new(&paths.config_dir);
+                    let _ = credentials.load();
+
+                    let status = credentials.token_status(url);
+                    let mut result = format!("MCP server '{}' OAuth status:\n\n", name);
+                    result.push_str(&format!("  Client ID: {}\n", client_id));
+                    if !scopes.is_empty() {
+                        result.push_str(&format!("  Scopes: {}\n", scopes.join(" ")));
+                    }
+                    result.push_str(&format!(
+                        "  Status: {} {}\n",
+                        status.symbol(),
+                        status.description()
+                    ));
+
+                    if let Some(token) = credentials.get_token(url)
+                        && let Some(expires) = token.expires_at
+                    {
+                        result.push_str(&format!("  Expires: {}\n", expires));
+                    }
+
+                    Ok(result)
+                }
+            }
+        }
+
+        "oauth_login" => {
+            let name = arguments
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'name' argument"))?;
+
+            let server = paths
+                .preferences
+                .global_prefs
+                .mcp_servers
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found", name))?
+                .clone();
+
+            let (url, auth) = match &server {
+                McpServerConfig::Sse { url, auth } => (url.clone(), auth.clone()),
+                McpServerConfig::Http { http_url, auth } => (http_url.clone(), auth.clone()),
+                McpServerConfig::Stdio { .. } => {
+                    return Err(anyhow::anyhow!(
+                        "MCP server '{}' is a local (stdio) server - OAuth not applicable.",
+                        name
+                    ));
+                }
+            };
+
+            match auth {
+                McpAuth::OAuth {
+                    client_id,
+                    client_secret,
+                    auth_server_url,
+                    scopes,
+                } => {
+                    let rt = tokio::runtime::Runtime::new()?;
+                    let token = rt.block_on(oauth::run_oauth_flow(
+                        &url,
+                        &client_id,
+                        client_secret.as_deref(),
+                        scopes,
+                        auth_server_url.as_deref(),
+                    ))?;
+
+                    let mut credentials = CredentialManager::new(&paths.config_dir);
+                    let _ = credentials.load();
+                    credentials.store_token(&url, token)?;
+
+                    Ok(format!(
+                        "Successfully authenticated for '{}'. Run 'sync' to update agent configs.",
+                        name
+                    ))
+                }
+                McpAuth::None => Err(anyhow::anyhow!(
+                    "MCP server '{}' has no authentication configured. Add OAuth config first.",
+                    name
+                )),
+                McpAuth::Bearer { .. } => Err(anyhow::anyhow!(
+                    "MCP server '{}' uses a static bearer token - no login needed.",
+                    name
+                )),
+            }
+        }
+
+        "oauth_logout" => {
+            let name = arguments
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'name' argument"))?;
+
+            let server = paths
+                .preferences
+                .global_prefs
+                .mcp_servers
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found", name))?;
+
+            let url = match server {
+                McpServerConfig::Sse { url, .. } => url.clone(),
+                McpServerConfig::Http { http_url, .. } => http_url.clone(),
+                McpServerConfig::Stdio { .. } => {
+                    return Err(anyhow::anyhow!(
+                        "MCP server '{}' is a local (stdio) server - OAuth not applicable.",
+                        name
+                    ));
+                }
+            };
+
+            let mut credentials = CredentialManager::new(&paths.config_dir);
+            let _ = credentials.load();
+
+            if credentials.remove_token(&url)?.is_some() {
+                Ok(format!(
+                    "Removed OAuth token for '{}'. Run 'sync' to update agent configs.",
+                    name
+                ))
+            } else {
+                Ok(format!("No OAuth token found for '{}'.", name))
             }
         }
 

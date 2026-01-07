@@ -1,13 +1,16 @@
 mod app;
 mod config;
+mod credentials;
+mod http;
 mod mcp;
+mod oauth;
 mod preferences;
 mod ui;
 
 #[cfg(test)]
 mod tests;
 
-use crate::app::{ActiveTab, App, AppMode, PrefEditorFocus};
+use crate::app::{ActiveTab, App, AppMode, OAuthFlowConfig, PrefEditorFocus};
 use anyhow::Result;
 use crossterm::{
     event::{
@@ -222,7 +225,7 @@ where
                         match app.active_tab {
                             ActiveTab::Dashboard => handle_dashboard_input(app, key, terminal)?,
                             ActiveTab::Preferences => handle_preferences_input(app, key)?,
-                            ActiveTab::McpServers => handle_mcp_input(app, key)?,
+                            ActiveTab::McpServers => handle_mcp_input(app, key, terminal)?,
                         }
                     }
                 },
@@ -256,7 +259,14 @@ where
     }
 }
 
-fn handle_mcp_input(app: &mut App, key: event::KeyEvent) -> Result<()> {
+fn handle_mcp_input<B: ratatui::backend::Backend + std::io::Write>(
+    app: &mut App,
+    key: event::KeyEvent,
+    terminal: &mut Terminal<B>,
+) -> Result<()>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     match key.code {
         KeyCode::Char('q') => {
             app.should_quit = true;
@@ -285,8 +295,87 @@ fn handle_mcp_input(app: &mut App, key: event::KeyEvent) -> Result<()> {
         KeyCode::Char('s') => {
             let _ = app.sync_preferences();
         }
+        KeyCode::Char('o') => {
+            handle_oauth_action(app, terminal)?;
+        }
         _ => {}
     }
+    Ok(())
+}
+
+fn handle_oauth_action<B: ratatui::backend::Backend + std::io::Write>(
+    app: &mut App,
+    terminal: &mut Terminal<B>,
+) -> Result<()>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    if !app.mcp_requires_oauth() {
+        app.set_status("Selected server does not use OAuth".to_string());
+        return Ok(());
+    }
+
+    let Some((status, _)) = app.get_selected_mcp_oauth_status() else {
+        app.set_status("Could not get OAuth status".to_string());
+        return Ok(());
+    };
+
+    match status {
+        crate::credentials::TokenStatus::Valid => {
+            app.mcp_oauth_logout();
+        }
+        _ => {
+            let Some(OAuthFlowConfig {
+                server_url,
+                client_id,
+                client_secret,
+                scopes,
+                auth_server_url,
+            }) = app.get_mcp_oauth_config()
+            else {
+                app.set_status("Could not get OAuth configuration".to_string());
+                return Ok(());
+            };
+
+            app.set_status("Opening browser for OAuth login...".to_string());
+            terminal.draw(|f| crate::ui::render(f, app))?;
+
+            disable_raw_mode()?;
+            execute!(
+                terminal.backend_mut(),
+                LeaveAlternateScreen,
+                DisableMouseCapture
+            )?;
+            terminal.show_cursor()?;
+
+            let rt = tokio::runtime::Runtime::new()?;
+            let result = rt.block_on(crate::oauth::run_oauth_flow(
+                &server_url,
+                &client_id,
+                client_secret.as_deref(),
+                scopes,
+                auth_server_url.as_deref(),
+            ));
+
+            enable_raw_mode()?;
+            execute!(
+                terminal.backend_mut(),
+                EnterAlternateScreen,
+                EnableMouseCapture
+            )?;
+            terminal.clear()?;
+
+            match result {
+                Ok(token) => {
+                    app.store_oauth_token(&server_url, token);
+                }
+                Err(e) => {
+                    app.set_status(format!("OAuth login failed: {}", e));
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 

@@ -1,5 +1,7 @@
-use crate::app::{ActiveTab, App, AppMode, Focus, McpFieldFocus, PrefEditorFocus};
+use crate::app::{ActiveTab, App, AppMode, Focus, McpAuthType, McpFieldFocus, PrefEditorFocus};
 use crate::config::{AgentStatus, SyncStrategy};
+use crate::credentials::TokenStatus;
+use crate::preferences::McpAuth;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -14,6 +16,75 @@ use syntect::parsing::SyntaxSet;
 
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
+
+fn format_auth_details<'a>(details: &mut Vec<Line<'a>>, auth: &'a McpAuth) {
+    match auth {
+        McpAuth::None => {}
+        McpAuth::Bearer { .. } => {
+            details.push(Line::from(""));
+            details.push(Line::from(vec![
+                Span::styled("Auth: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled("Bearer token", Style::default().fg(Color::Green)),
+            ]));
+        }
+        McpAuth::OAuth {
+            client_id, scopes, ..
+        } => {
+            details.push(Line::from(""));
+            details.push(Line::from(vec![
+                Span::styled("Auth: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled("OAuth 2.1", Style::default().fg(Color::Yellow)),
+            ]));
+            details.push(Line::from(vec![
+                Span::styled("Client ID: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(client_id.as_str()),
+            ]));
+            if !scopes.is_empty() {
+                details.push(Line::from(vec![
+                    Span::styled("Scopes: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(scopes.join(" ")),
+                ]));
+            }
+        }
+    }
+}
+
+fn format_oauth_status(details: &mut Vec<Line<'_>>, app: &App, url: &str, auth: &McpAuth) {
+    if !matches!(auth, McpAuth::OAuth { .. }) {
+        return;
+    }
+
+    let status = app.credentials.token_status(url);
+    details.push(Line::from(""));
+
+    let (status_text, status_color) = match status {
+        TokenStatus::Valid => ("Authenticated", Color::Green),
+        TokenStatus::ExpiresSoon => ("Token expires soon", Color::Yellow),
+        TokenStatus::Expired => ("Token expired", Color::Red),
+        TokenStatus::None => ("Not authenticated", Color::Red),
+    };
+
+    details.push(Line::from(vec![
+        Span::styled("Status: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(status_text, Style::default().fg(status_color)),
+    ]));
+
+    details.push(Line::from(""));
+    match status {
+        TokenStatus::Valid => {
+            details.push(Line::from(vec![
+                Span::styled("[o]", Style::default().fg(Color::Cyan)),
+                Span::raw(" Logout"),
+            ]));
+        }
+        _ => {
+            details.push(Line::from(vec![
+                Span::styled("[o]", Style::default().fg(Color::Cyan)),
+                Span::raw(" Login with OAuth"),
+            ]));
+        }
+    }
+}
 
 fn highlight_markdown(content: &str) -> Vec<Line<'_>> {
     let ps = &SYNTAX_SET;
@@ -376,7 +447,7 @@ fn render_search_dialog(f: &mut Frame, app: &App) {
             Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
         ]),
         Line::from(""),
-        Line::from("[Esc] Cancel | [Enter] Apply | [Backspace] Delete | Type to search"),
+        Line::from("[Esc] Cancel | [Enter] Apply | [Bksp] Del"),
     ];
 
     let dialog = Paragraph::new(text).block(
@@ -483,6 +554,17 @@ fn render_help(f: &mut Frame, app: &App) {
         Line::from("  a                 - Toggle auto-sync mode"),
         Line::from("  /                 - Search agents by name/path"),
         Line::from("  v                 - Toggle error/status log"),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "MCP Servers (Tab 3):",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]),
+        Line::from("  a                 - Add new MCP server"),
+        Line::from("  e / Enter         - Edit selected server"),
+        Line::from("  d                 - Delete selected server"),
+        Line::from("  o                 - OAuth login/logout (for OAuth servers)"),
+        Line::from("  m                 - Add default MCP servers (magic setup)"),
+        Line::from("  s                 - Sync preferences to all agents"),
         Line::from(""),
         Line::from(vec![Span::styled(
             "Other:",
@@ -1064,7 +1146,7 @@ fn render_mcp_servers(f: &mut Frame, app: &App) {
                         details.push(Line::from(""));
                     }
                 }
-                crate::preferences::McpServerConfig::Sse { url } => {
+                crate::preferences::McpServerConfig::Sse { url, auth } => {
                     details.push(Line::from(vec![
                         Span::styled("Type: ", Style::default().add_modifier(Modifier::BOLD)),
                         Span::styled("remote (SSE)", Style::default().fg(Color::Blue)),
@@ -1075,6 +1157,24 @@ fn render_mcp_servers(f: &mut Frame, app: &App) {
                         Span::styled("URL: ", Style::default().add_modifier(Modifier::BOLD)),
                         Span::raw(url),
                     ]));
+
+                    format_auth_details(&mut details, auth);
+                    format_oauth_status(&mut details, app, url, auth);
+                }
+                crate::preferences::McpServerConfig::Http { http_url, auth } => {
+                    details.push(Line::from(vec![
+                        Span::styled("Type: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::styled("remote (HTTP)", Style::default().fg(Color::Cyan)),
+                    ]));
+                    details.push(Line::from(""));
+
+                    details.push(Line::from(vec![
+                        Span::styled("URL: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(http_url),
+                    ]));
+
+                    format_auth_details(&mut details, auth);
+                    format_oauth_status(&mut details, app, http_url, auth);
                 }
             }
 
@@ -1109,30 +1209,51 @@ fn render_mcp_servers(f: &mut Frame, app: &App) {
         );
     }
 
-    let hints = Line::from(vec![
+    let mut hint_spans = vec![
         Span::styled("[j/k]", Style::default().fg(Color::Cyan)),
-        Span::raw(" Navigate | "),
+        Span::raw(" Nav | "),
         Span::styled("[a]", Style::default().fg(Color::Cyan)),
         Span::raw(" Add | "),
-        Span::styled("[e/Enter]", Style::default().fg(Color::Cyan)),
+        Span::styled("[e]", Style::default().fg(Color::Cyan)),
         Span::raw(" Edit | "),
         Span::styled("[d]", Style::default().fg(Color::Cyan)),
-        Span::raw(" Delete | "),
+        Span::raw(" Del | "),
+    ];
+
+    if app.mcp_requires_oauth() {
+        hint_spans.push(Span::styled("[o]", Style::default().fg(Color::Yellow)));
+        hint_spans.push(Span::raw(" OAuth | "));
+    }
+
+    hint_spans.extend(vec![
         Span::styled("[m]", Style::default().fg(Color::Cyan)),
         Span::raw(" Magic | "),
         Span::styled("[s]", Style::default().fg(Color::Cyan)),
-        Span::raw(" Sync All | "),
+        Span::raw(" Sync | "),
         Span::styled("[q]", Style::default().fg(Color::Cyan)),
         Span::raw(" Quit"),
     ]);
+
+    let hints = Line::from(hint_spans);
     f.render_widget(Paragraph::new(hints), chunks[4]);
 }
 
 fn render_mcp_edit_dialog(f: &mut Frame, app: &App) {
     let area = f.area();
+    let is_remote = app.mcp_editor_state.is_remote_server();
+    let auth_type = app.mcp_editor_state.editing_auth_type;
+
+    let height = if is_remote {
+        match auth_type {
+            McpAuthType::None => 18,
+            McpAuthType::Bearer => 21,
+            McpAuthType::OAuth => 30,
+        }
+    } else {
+        18
+    };
 
     let width = 80;
-    let height = 20;
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
 
@@ -1156,18 +1277,6 @@ fn render_mcp_edit_dialog(f: &mut Frame, app: &App) {
         .style(Style::default().bg(Color::Black));
 
     f.render_widget(block, dialog_area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .margin(1)
-        .constraints([
-            Constraint::Length(3), // Name
-            Constraint::Length(3), // Command
-            Constraint::Length(3), // Args
-            Constraint::Min(3),    // Env
-            Constraint::Length(2), // Help
-        ])
-        .split(dialog_area);
 
     let draw_input = |f: &mut Frame,
                       title: &str,
@@ -1196,48 +1305,231 @@ fn render_mcp_edit_dialog(f: &mut Frame, app: &App) {
         f.render_widget(Paragraph::new(text).block(block), area);
     };
 
-    draw_input(
-        f,
-        "Name (Unique ID)",
-        &app.mcp_editor_state.editing_name,
-        app.mcp_editor_state.focus,
-        McpFieldFocus::Name,
-        chunks[0],
-    );
-    draw_input(
-        f,
-        "Command / URL (for SSE)",
-        &app.mcp_editor_state.editing_command,
-        app.mcp_editor_state.focus,
-        McpFieldFocus::Command,
-        chunks[1],
-    );
-    draw_input(
-        f,
-        "Args (Space separated - Stdio only)",
-        &app.mcp_editor_state.editing_args,
-        app.mcp_editor_state.focus,
-        McpFieldFocus::Args,
-        chunks[2],
-    );
-    draw_input(
-        f,
-        "Env (KEY=VAL,KEY=VAL - Stdio only)",
-        &app.mcp_editor_state.editing_env,
-        app.mcp_editor_state.focus,
-        McpFieldFocus::Env,
-        chunks[3],
-    );
+    let draw_selector = |f: &mut Frame,
+                         title: &str,
+                         options: &[&str],
+                         selected: usize,
+                         focus: McpFieldFocus,
+                         target: McpFieldFocus,
+                         area: Rect| {
+        let style = if focus == target {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(style);
 
-    let help = Line::from(vec![
-        Span::styled("[Tab]", Style::default().fg(Color::Cyan)),
-        Span::raw(" Next Field | "),
-        Span::styled("[Enter]", Style::default().fg(Color::Cyan)),
-        Span::raw(" Save | "),
-        Span::styled("[Esc]", Style::default().fg(Color::Cyan)),
-        Span::raw(" Cancel | "),
-        Span::styled("Note:", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" URLs starting with http(s):// use SSE transport"),
-    ]);
-    f.render_widget(Paragraph::new(help), chunks[4]);
+        let display: Vec<Span> = options
+            .iter()
+            .enumerate()
+            .flat_map(|(i, opt)| {
+                let sep = if i > 0 { " | " } else { "" };
+                let opt_style = if i == selected {
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                vec![Span::raw(sep), Span::styled(*opt, opt_style)]
+            })
+            .collect();
+
+        f.render_widget(Paragraph::new(Line::from(display)).block(block), area);
+    };
+
+    if is_remote {
+        let mut constraints = vec![
+            Constraint::Length(3), // Name
+            Constraint::Length(3), // Command/URL
+            Constraint::Length(3), // Auth Type
+        ];
+
+        match auth_type {
+            McpAuthType::None => {
+                constraints.push(Constraint::Min(3)); // Help
+            }
+            McpAuthType::Bearer => {
+                constraints.push(Constraint::Length(3)); // Bearer Token
+                constraints.push(Constraint::Min(3)); // Help
+            }
+            McpAuthType::OAuth => {
+                constraints.push(Constraint::Length(3)); // Client ID
+                constraints.push(Constraint::Length(3)); // Client Secret
+                constraints.push(Constraint::Length(3)); // Scopes
+                constraints.push(Constraint::Length(3)); // Auth Server URL
+                constraints.push(Constraint::Min(3)); // Help
+            }
+        }
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints(constraints)
+            .split(dialog_area);
+
+        draw_input(
+            f,
+            "Name (Unique ID)",
+            &app.mcp_editor_state.editing_name,
+            app.mcp_editor_state.focus,
+            McpFieldFocus::Name,
+            chunks[0],
+        );
+        draw_input(
+            f,
+            "URL (SSE/HTTP endpoint)",
+            &app.mcp_editor_state.editing_command,
+            app.mcp_editor_state.focus,
+            McpFieldFocus::Command,
+            chunks[1],
+        );
+
+        let auth_idx = match auth_type {
+            McpAuthType::None => 0,
+            McpAuthType::Bearer => 1,
+            McpAuthType::OAuth => 2,
+        };
+        draw_selector(
+            f,
+            "Auth Type [Space/h/l to cycle]",
+            &["None", "Bearer", "OAuth"],
+            auth_idx,
+            app.mcp_editor_state.focus,
+            McpFieldFocus::AuthType,
+            chunks[2],
+        );
+
+        let help_idx = match auth_type {
+            McpAuthType::None => 3,
+            McpAuthType::Bearer => {
+                draw_input(
+                    f,
+                    "Bearer Token",
+                    &app.mcp_editor_state.editing_bearer_token,
+                    app.mcp_editor_state.focus,
+                    McpFieldFocus::BearerToken,
+                    chunks[3],
+                );
+                4
+            }
+            McpAuthType::OAuth => {
+                draw_input(
+                    f,
+                    "Client ID (required)",
+                    &app.mcp_editor_state.editing_oauth_client_id,
+                    app.mcp_editor_state.focus,
+                    McpFieldFocus::OAuthClientId,
+                    chunks[3],
+                );
+                draw_input(
+                    f,
+                    "Client Secret (optional)",
+                    &app.mcp_editor_state.editing_oauth_client_secret,
+                    app.mcp_editor_state.focus,
+                    McpFieldFocus::OAuthClientSecret,
+                    chunks[4],
+                );
+                draw_input(
+                    f,
+                    "Scopes (space separated, optional)",
+                    &app.mcp_editor_state.editing_oauth_scopes,
+                    app.mcp_editor_state.focus,
+                    McpFieldFocus::OAuthScopes,
+                    chunks[5],
+                );
+                draw_input(
+                    f,
+                    "Auth Server URL (optional, auto-discovered)",
+                    &app.mcp_editor_state.editing_oauth_auth_server_url,
+                    app.mcp_editor_state.focus,
+                    McpFieldFocus::OAuthAuthServerUrl,
+                    chunks[6],
+                );
+                7
+            }
+        };
+
+        let help = vec![
+            Line::from(vec![
+                Span::styled("[Tab]", Style::default().fg(Color::Cyan)),
+                Span::raw(" Next | "),
+                Span::styled("[Enter]", Style::default().fg(Color::Cyan)),
+                Span::raw(" Save | "),
+                Span::styled("[Esc]", Style::default().fg(Color::Cyan)),
+                Span::raw(" Cancel"),
+            ]),
+            Line::from(vec![
+                Span::styled("OAuth: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw("After saving, press 'o' to authenticate"),
+            ]),
+        ];
+        f.render_widget(Paragraph::new(help), chunks[help_idx]);
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(3), // Name
+                Constraint::Length(3), // Command
+                Constraint::Length(3), // Args
+                Constraint::Length(3), // Env
+                Constraint::Min(3),    // Help
+            ])
+            .split(dialog_area);
+
+        draw_input(
+            f,
+            "Name (Unique ID)",
+            &app.mcp_editor_state.editing_name,
+            app.mcp_editor_state.focus,
+            McpFieldFocus::Name,
+            chunks[0],
+        );
+        draw_input(
+            f,
+            "Command",
+            &app.mcp_editor_state.editing_command,
+            app.mcp_editor_state.focus,
+            McpFieldFocus::Command,
+            chunks[1],
+        );
+        draw_input(
+            f,
+            "Args (space separated)",
+            &app.mcp_editor_state.editing_args,
+            app.mcp_editor_state.focus,
+            McpFieldFocus::Args,
+            chunks[2],
+        );
+        draw_input(
+            f,
+            "Env (KEY=VAL,KEY=VAL)",
+            &app.mcp_editor_state.editing_env,
+            app.mcp_editor_state.focus,
+            McpFieldFocus::Env,
+            chunks[3],
+        );
+
+        let help = vec![
+            Line::from(vec![
+                Span::styled("[Tab]", Style::default().fg(Color::Cyan)),
+                Span::raw(" Next | "),
+                Span::styled("[Enter]", Style::default().fg(Color::Cyan)),
+                Span::raw(" Save | "),
+                Span::styled("[Esc]", Style::default().fg(Color::Cyan)),
+                Span::raw(" Cancel"),
+            ]),
+            Line::from(vec![
+                Span::styled("Tip: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw("Use http(s):// URL for remote SSE servers"),
+            ]),
+        ];
+        f.render_widget(Paragraph::new(help), chunks[4]);
+    }
 }

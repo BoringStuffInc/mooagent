@@ -4,6 +4,35 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum McpAuth {
+    #[default]
+    None,
+    Bearer {
+        token: String,
+    },
+    OAuth {
+        client_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_secret: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_server_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        scopes: Vec<String>,
+    },
+}
+
+impl McpAuth {
+    pub fn is_none(&self) -> bool {
+        matches!(self, McpAuth::None)
+    }
+
+    pub fn requires_oauth(&self) -> bool {
+        matches!(self, McpAuth::OAuth { .. })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum McpServerConfig {
@@ -16,7 +45,38 @@ pub enum McpServerConfig {
     },
     Sse {
         url: String,
+        #[serde(default, skip_serializing_if = "McpAuth::is_none")]
+        auth: McpAuth,
     },
+    Http {
+        #[serde(rename = "httpUrl")]
+        http_url: String,
+        #[serde(default, skip_serializing_if = "McpAuth::is_none")]
+        auth: McpAuth,
+    },
+}
+
+impl McpServerConfig {
+    #[allow(dead_code)]
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            McpServerConfig::Sse { url, .. } => Some(url),
+            McpServerConfig::Http { http_url, .. } => Some(http_url),
+            McpServerConfig::Stdio { .. } => None,
+        }
+    }
+
+    pub fn auth(&self) -> Option<&McpAuth> {
+        match self {
+            McpServerConfig::Sse { auth, .. } => Some(auth),
+            McpServerConfig::Http { auth, .. } => Some(auth),
+            McpServerConfig::Stdio { .. } => None,
+        }
+    }
+
+    pub fn requires_oauth(&self) -> bool {
+        self.auth().map(|a| a.requires_oauth()).unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -66,9 +126,52 @@ struct ProjectConfigWrapper {
     preferences: Option<AgentPreferences>,
 }
 
+use crate::credentials::CredentialManager;
+
 pub trait ConfigGenerator {
     fn agent_name(&self) -> &str;
-    fn generate(&self, prefs: &AgentPreferences) -> Result<Vec<(PathBuf, String)>>;
+    fn generate(
+        &self,
+        prefs: &AgentPreferences,
+        credentials: Option<&CredentialManager>,
+    ) -> Result<Vec<(PathBuf, String)>>;
+}
+
+fn get_auth_headers(
+    config: &McpServerConfig,
+    credentials: Option<&CredentialManager>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let (url, auth) = match config {
+        McpServerConfig::Sse { url, auth } => (url, auth),
+        McpServerConfig::Http { http_url, auth } => (http_url, auth),
+        McpServerConfig::Stdio { .. } => return None,
+    };
+
+    match auth {
+        McpAuth::Bearer { token } => {
+            let mut headers = serde_json::Map::new();
+            headers.insert(
+                "Authorization".to_string(),
+                serde_json::Value::String(format!("Bearer {}", token)),
+            );
+            Some(headers)
+        }
+        McpAuth::OAuth { .. } => {
+            if let Some(creds) = credentials
+                && let Some(token) = creds.get_valid_token(url)
+            {
+                let mut headers = serde_json::Map::new();
+                headers.insert(
+                    "Authorization".to_string(),
+                    serde_json::Value::String(format!("Bearer {}", token.access_token)),
+                );
+                Some(headers)
+            } else {
+                None
+            }
+        }
+        McpAuth::None => None,
+    }
 }
 
 impl PreferenceManager {
@@ -263,7 +366,11 @@ impl ConfigGenerator for ClaudeConfigGenerator {
         "Claude"
     }
 
-    fn generate(&self, prefs: &AgentPreferences) -> Result<Vec<(PathBuf, String)>> {
+    fn generate(
+        &self,
+        prefs: &AgentPreferences,
+        credentials: Option<&CredentialManager>,
+    ) -> Result<Vec<(PathBuf, String)>> {
         let agent_prefs = prefs.agent_specific.get("Claude");
 
         if agent_prefs.is_none() && prefs.mcp_servers.is_empty() {
@@ -334,13 +441,31 @@ impl ConfigGenerator for ClaudeConfigGenerator {
                         );
                         server_def.insert("env".to_string(), serde_json::to_value(env)?);
                     }
-                    McpServerConfig::Sse { url } => {
+                    McpServerConfig::Sse { url, .. } => {
                         server_def.insert(
                             "type".to_string(),
                             serde_json::Value::String("sse".to_string()),
                         );
                         server_def
                             .insert("url".to_string(), serde_json::Value::String(url.clone()));
+                        if let Some(headers) = get_auth_headers(config, credentials) {
+                            server_def
+                                .insert("headers".to_string(), serde_json::Value::Object(headers));
+                        }
+                    }
+                    McpServerConfig::Http { http_url, .. } => {
+                        server_def.insert(
+                            "type".to_string(),
+                            serde_json::Value::String("http".to_string()),
+                        );
+                        server_def.insert(
+                            "url".to_string(),
+                            serde_json::Value::String(http_url.clone()),
+                        );
+                        if let Some(headers) = get_auth_headers(config, credentials) {
+                            server_def
+                                .insert("headers".to_string(), serde_json::Value::Object(headers));
+                        }
                     }
                 }
                 servers.insert(name.clone(), serde_json::Value::Object(server_def));
@@ -366,7 +491,11 @@ impl ConfigGenerator for GeminiConfigGenerator {
         "Gemini"
     }
 
-    fn generate(&self, prefs: &AgentPreferences) -> Result<Vec<(PathBuf, String)>> {
+    fn generate(
+        &self,
+        prefs: &AgentPreferences,
+        credentials: Option<&CredentialManager>,
+    ) -> Result<Vec<(PathBuf, String)>> {
         let agent_prefs = prefs.agent_specific.get("Gemini");
         let mut results = Vec::new();
 
@@ -422,8 +551,22 @@ impl ConfigGenerator for GeminiConfigGenerator {
                     );
                     server_def.insert("env".to_string(), serde_json::to_value(env)?);
                 }
-                McpServerConfig::Sse { url } => {
+                McpServerConfig::Sse { url, .. } => {
                     server_def.insert("url".to_string(), serde_json::Value::String(url.clone()));
+                    if let Some(headers) = get_auth_headers(config, credentials) {
+                        server_def
+                            .insert("headers".to_string(), serde_json::Value::Object(headers));
+                    }
+                }
+                McpServerConfig::Http { http_url, .. } => {
+                    server_def.insert(
+                        "httpUrl".to_string(),
+                        serde_json::Value::String(http_url.clone()),
+                    );
+                    if let Some(headers) = get_auth_headers(config, credentials) {
+                        server_def
+                            .insert("headers".to_string(), serde_json::Value::Object(headers));
+                    }
                 }
             }
             servers.insert(name.clone(), serde_json::Value::Object(server_def));
@@ -461,7 +604,11 @@ impl ConfigGenerator for OpenCodeConfigGenerator {
         "OpenCode"
     }
 
-    fn generate(&self, prefs: &AgentPreferences) -> Result<Vec<(PathBuf, String)>> {
+    fn generate(
+        &self,
+        prefs: &AgentPreferences,
+        credentials: Option<&CredentialManager>,
+    ) -> Result<Vec<(PathBuf, String)>> {
         let mut results = Vec::new();
 
         let config_path = self.config_dir.join("opencode.json");
@@ -492,12 +639,30 @@ impl ConfigGenerator for OpenCodeConfigGenerator {
                         server_def.insert("environment".to_string(), serde_json::to_value(env)?);
                     }
                 }
-                McpServerConfig::Sse { url } => {
+                McpServerConfig::Sse { url, .. } => {
                     server_def.insert(
                         "type".to_string(),
                         serde_json::Value::String("remote".to_string()),
                     );
                     server_def.insert("url".to_string(), serde_json::Value::String(url.clone()));
+                    if let Some(headers) = get_auth_headers(config, credentials) {
+                        server_def
+                            .insert("headers".to_string(), serde_json::Value::Object(headers));
+                    }
+                }
+                McpServerConfig::Http { http_url, .. } => {
+                    server_def.insert(
+                        "type".to_string(),
+                        serde_json::Value::String("remote".to_string()),
+                    );
+                    server_def.insert(
+                        "url".to_string(),
+                        serde_json::Value::String(http_url.clone()),
+                    );
+                    if let Some(headers) = get_auth_headers(config, credentials) {
+                        server_def
+                            .insert("headers".to_string(), serde_json::Value::Object(headers));
+                    }
                 }
             }
             mcp_servers.insert(name.clone(), serde_json::Value::Object(server_def));

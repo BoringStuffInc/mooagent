@@ -26,5 +26,6 @@ fmt:
 install:
     cargo build --release
     mkdir -p ~/.local/bin
+    rm -f ~/.local/bin/mooagent
     cp target/release/mooagent ~/.local/bin/mooagent
     @echo "Installed mooagent to ~/.local/bin/mooagent"

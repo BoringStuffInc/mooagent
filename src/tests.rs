@@ -39,7 +39,7 @@ mod tests {
         specific.plugins.insert("terminal".to_string(), true); // Enable terminal
         prefs.agent_specific.insert("Claude".to_string(), specific);
 
-        let results = generator.generate(&prefs).unwrap();
+        let results = generator.generate(&prefs, None).unwrap();
 
         // Find settings.json result
         let (_, content) = results.iter().find(|(p, _)| p == &settings_path).unwrap();
@@ -93,7 +93,7 @@ mod tests {
             },
         );
 
-        let results = generator.generate(&prefs).unwrap();
+        let results = generator.generate(&prefs, None).unwrap();
 
         let (_, content) = results
             .iter()

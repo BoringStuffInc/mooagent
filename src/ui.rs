@@ -1055,10 +1055,7 @@ fn render_mcp_servers(f: &mut Frame, app: &App) {
 
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(35),
-            Constraint::Percentage(65),
-        ])
+        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
         .split(chunks[2]);
 
     let servers: Vec<Line> = if app.mcp_editor_state.server_list.is_empty() {
@@ -1072,12 +1069,30 @@ fn render_mcp_servers(f: &mut Frame, app: &App) {
             .iter()
             .enumerate()
             .map(|(idx, server)| {
-                let style = if idx == app.mcp_editor_state.selected_server_idx {
-                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                let is_disabled = app
+                    .paths
+                    .preferences
+                    .project_prefs
+                    .as_ref()
+                    .map(|p| p.disabled_mcp_servers.contains(server))
+                    .unwrap_or(false);
+
+                let (style, text) = if idx == app.mcp_editor_state.selected_server_idx {
+                    let s = Style::default().fg(Color::Black).bg(Color::Cyan);
+                    if is_disabled {
+                        (s, format!("  {} (Disabled in Project)", server))
+                    } else {
+                        (s, format!("  {}", server))
+                    }
+                } else if is_disabled {
+                    (
+                        Style::default().fg(Color::Red),
+                        format!("  {} (Disabled)", server),
+                    )
                 } else {
-                    Style::default().fg(Color::White)
+                    (Style::default().fg(Color::White), format!("  {}", server))
                 };
-                Line::from(vec![Span::styled(format!("  {}", server), style)])
+                Line::from(vec![Span::styled(text, style)])
             })
             .collect()
     };
@@ -1093,6 +1108,14 @@ fn render_mcp_servers(f: &mut Frame, app: &App) {
         let server_name =
             &app.mcp_editor_state.server_list[app.mcp_editor_state.selected_server_idx];
 
+        let is_disabled = app
+            .paths
+            .preferences
+            .project_prefs
+            .as_ref()
+            .map(|p| p.disabled_mcp_servers.contains(server_name))
+            .unwrap_or(false);
+
         if let Some(config) = app
             .paths
             .preferences
@@ -1104,6 +1127,15 @@ fn render_mcp_servers(f: &mut Frame, app: &App) {
                 Span::styled("Name: ", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(server_name),
             ]));
+
+            if is_disabled {
+                details.push(Line::from(""));
+                details.push(Line::from(vec![Span::styled(
+                    "⚠️  Disabled in current project",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )]));
+            }
+
             details.push(Line::from(""));
 
             match config {
@@ -1205,6 +1237,8 @@ fn render_mcp_servers(f: &mut Frame, app: &App) {
     let mut hint_spans = vec![
         Span::styled("[j/k]", Style::default().fg(Color::Cyan)),
         Span::raw(" Nav | "),
+        Span::styled("[Space]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Toggle | "),
         Span::styled("[a]", Style::default().fg(Color::Cyan)),
         Span::raw(" Add | "),
         Span::styled("[e]", Style::default().fg(Color::Cyan)),

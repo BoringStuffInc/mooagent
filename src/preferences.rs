@@ -90,6 +90,8 @@ pub struct AgentPreferences {
     #[serde(default)]
     pub mcp_servers: HashMap<String, McpServerConfig>,
     #[serde(default)]
+    pub disabled_mcp_servers: Vec<String>,
+    #[serde(default)]
     pub agent_specific: HashMap<String, AgentSpecificPrefs>,
 }
 
@@ -256,6 +258,14 @@ impl PreferenceManager {
             merged.mcp_servers.insert(k, v);
         }
 
+        merged
+            .disabled_mcp_servers
+            .extend(over.disabled_mcp_servers);
+
+        for name in &merged.disabled_mcp_servers {
+            merged.mcp_servers.remove(name);
+        }
+
         for (agent_name, agent_conf) in over.agent_specific {
             let entry = merged.agent_specific.entry(agent_name).or_default();
 
@@ -296,6 +306,7 @@ impl PreferenceManager {
             tool_presets,
             individual_tools: HashMap::new(),
             mcp_servers: HashMap::new(),
+            disabled_mcp_servers: Vec::new(),
             agent_specific: HashMap::new(),
         }
     }
@@ -306,6 +317,39 @@ impl PreferenceManager {
             fs::create_dir_all(parent)?;
         }
         fs::write(&self.global_path, content)?;
+        Ok(())
+    }
+
+    pub fn save_project(&self, config_file: &Path) -> Result<()> {
+        let Some(prefs) = &self.project_prefs else {
+            return Ok(());
+        };
+
+        let mut existing_content = String::new();
+        if config_file.exists() {
+            existing_content = fs::read_to_string(config_file).unwrap_or_default();
+        }
+
+        let mut toml_val: toml::Value = if !existing_content.is_empty() {
+            toml::from_str(&existing_content)
+                .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()))
+        } else {
+            toml::Value::Table(toml::map::Map::new())
+        };
+
+        let prefs_val = toml::Value::try_from(prefs.clone())?;
+
+        // Preserve other fields in .mooagent.toml (e.g. agents)
+        if let toml::Value::Table(ref mut map) = toml_val {
+            map.insert("preferences".to_string(), prefs_val);
+        }
+
+        let content = toml::to_string_pretty(&toml_val)?;
+
+        if let Some(parent) = config_file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(config_file, content)?;
         Ok(())
     }
 }

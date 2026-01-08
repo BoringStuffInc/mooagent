@@ -171,4 +171,48 @@ mod tests {
             panic!("Expected Stdio config");
         }
     }
+
+    #[test]
+    fn test_disabled_mcp_servers() {
+        let dir = tempdir().unwrap();
+        let config_dir = dir.path().join(".config");
+        fs::create_dir_all(&config_dir).unwrap();
+
+        let mut mgr = crate::preferences::PreferenceManager::new(&config_dir);
+
+        let mut global_prefs = crate::preferences::AgentPreferences::default();
+        global_prefs.mcp_servers.insert(
+            "global-server".to_string(),
+            crate::preferences::McpServerConfig::Stdio {
+                command: "echo".to_string(),
+                args: vec![],
+                env: std::collections::HashMap::new(),
+            },
+        );
+        global_prefs.mcp_servers.insert(
+            "other-server".to_string(),
+            crate::preferences::McpServerConfig::Stdio {
+                command: "echo".to_string(),
+                args: vec![],
+                env: std::collections::HashMap::new(),
+            },
+        );
+        mgr.global_prefs = global_prefs;
+
+        let mut project_prefs = crate::preferences::AgentPreferences::default();
+        project_prefs
+            .disabled_mcp_servers
+            .push("global-server".to_string());
+        mgr.project_prefs = Some(project_prefs);
+
+        let merged = mgr.get_merged();
+
+        assert!(!merged.mcp_servers.contains_key("global-server"));
+        assert!(merged.mcp_servers.contains_key("other-server"));
+        assert!(
+            merged
+                .disabled_mcp_servers
+                .contains(&"global-server".to_string())
+        );
+    }
 }

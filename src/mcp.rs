@@ -455,7 +455,8 @@ fn call_tool(name: &str, arguments: Value) -> Result<String> {
 
     match name {
         "mcp_list" => {
-            let servers = &paths.preferences.global_prefs.mcp_servers;
+            let merged = paths.preferences.get_merged();
+            let servers = &merged.mcp_servers;
             if servers.is_empty() {
                 return Ok("No MCP servers configured.".to_string());
             }
@@ -463,7 +464,7 @@ fn call_tool(name: &str, arguments: Value) -> Result<String> {
             let mut credentials = CredentialManager::new(&paths.config_dir);
             let _ = credentials.load();
 
-            let mut result = String::from("Configured MCP servers:\n\n");
+            let mut result = String::from("Configured MCP servers (Effective):\n\n");
             for (name, config) in servers {
                 result.push_str(&format!("- **{}**\n", name));
                 match config {

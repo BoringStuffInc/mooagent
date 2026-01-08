@@ -432,6 +432,43 @@ impl App {
         self.set_status(format!("Deleted MCP server: {}", server_name));
     }
 
+    pub fn mcp_toggle_enabled(&mut self) {
+        if self.mcp_editor_state.server_list.is_empty() {
+            return;
+        }
+        let server_name =
+            self.mcp_editor_state.server_list[self.mcp_editor_state.selected_server_idx].clone();
+
+        if self.paths.preferences.project_prefs.is_none() {
+            self.paths.preferences.project_prefs =
+                Some(crate::preferences::AgentPreferences::default());
+        }
+
+        if let Some(project_prefs) = &mut self.paths.preferences.project_prefs {
+            if let Some(pos) = project_prefs
+                .disabled_mcp_servers
+                .iter()
+                .position(|x| x == &server_name)
+            {
+                project_prefs.disabled_mcp_servers.remove(pos);
+                self.set_status(format!(
+                    "Enabled MCP server: {} for this project",
+                    server_name
+                ));
+            } else {
+                project_prefs.disabled_mcp_servers.push(server_name.clone());
+                self.set_status(format!(
+                    "Disabled MCP server: {} for this project",
+                    server_name
+                ));
+            }
+
+            if let Err(e) = self.paths.preferences.save_project(&self.paths.config_file) {
+                self.set_status(format!("Failed to save project config: {}", e));
+            }
+        }
+    }
+
     pub fn mcp_submit(&mut self) {
         let name = self.mcp_editor_state.editing_name.trim().to_string();
         let command = self.mcp_editor_state.editing_command.trim().to_string();

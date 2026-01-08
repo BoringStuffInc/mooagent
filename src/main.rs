@@ -289,6 +289,9 @@ where
         KeyCode::Char('d') => {
             app.mcp_delete();
         }
+        KeyCode::Char(' ') => {
+            app.mcp_toggle_enabled();
+        }
         KeyCode::Char('m') => {
             app.magic_mcp_setup();
         }

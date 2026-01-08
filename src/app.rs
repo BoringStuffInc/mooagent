@@ -540,6 +540,10 @@ impl App {
             if let Err(e) = self.paths.preferences.save_project(&self.paths.config_file) {
                 self.set_status(format!("Failed to save project config: {}", e));
             }
+
+            if self.auto_sync {
+                let _ = self.sync_preferences();
+            }
         }
     }
 

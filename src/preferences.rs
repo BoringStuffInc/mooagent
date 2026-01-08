@@ -431,6 +431,7 @@ fn read_json_or_empty(path: &Path) -> serde_json::Map<String, serde_json::Value>
 pub struct ClaudeConfigGenerator {
     pub config_dir: PathBuf,
     pub user_config_path: PathBuf,
+    pub project_path: PathBuf,
 }
 
 impl ConfigGenerator for ClaudeConfigGenerator {
@@ -444,10 +445,6 @@ impl ConfigGenerator for ClaudeConfigGenerator {
         credentials: Option<&CredentialManager>,
     ) -> Result<Vec<(PathBuf, String)>> {
         let agent_prefs = prefs.agent_specific.get("Claude");
-
-        if agent_prefs.is_none() && prefs.mcp_servers.is_empty() {
-            return Ok(Vec::new());
-        }
 
         let mut results = Vec::new();
 
@@ -476,14 +473,20 @@ impl ConfigGenerator for ClaudeConfigGenerator {
             results.push((settings_path, serde_json::to_string_pretty(&settings_map)?));
         }
 
-        if !prefs.mcp_servers.is_empty() {
-            let mut user_map = read_json_or_empty(&self.user_config_path);
+        let mut user_map = read_json_or_empty(&self.user_config_path);
 
+        if !prefs.mcp_servers.is_empty() {
             let mut servers = serde_json::Map::new();
             for (name, config) in &prefs.mcp_servers {
                 let mut server_def = serde_json::Map::new();
                 match config {
-                    McpServerConfig::Stdio { command, args, env, .. } => {
+                    McpServerConfig::Stdio {
+                        command,
+                        args,
+                        env,
+                        auto_allow,
+                        ..
+                    } => {
                         server_def.insert(
                             "type".to_string(),
                             serde_json::Value::String("stdio".to_string()),
@@ -501,8 +504,16 @@ impl ConfigGenerator for ClaudeConfigGenerator {
                             ),
                         );
                         server_def.insert("env".to_string(), serde_json::to_value(env)?);
+                        if *auto_allow {
+                            server_def
+                                .insert("autoAllow".to_string(), serde_json::Value::Bool(true));
+                        }
                     }
-                    McpServerConfig::Sse { url, .. } => {
+                    McpServerConfig::Sse {
+                        url,
+                        auto_allow,
+                        ..
+                    } => {
                         server_def.insert(
                             "type".to_string(),
                             serde_json::Value::String("sse".to_string()),
@@ -513,8 +524,16 @@ impl ConfigGenerator for ClaudeConfigGenerator {
                             server_def
                                 .insert("headers".to_string(), serde_json::Value::Object(headers));
                         }
+                        if *auto_allow {
+                            server_def
+                                .insert("autoAllow".to_string(), serde_json::Value::Bool(true));
+                        }
                     }
-                    McpServerConfig::Http { http_url, .. } => {
+                    McpServerConfig::Http {
+                        http_url,
+                        auto_allow,
+                        ..
+                    } => {
                         server_def.insert(
                             "type".to_string(),
                             serde_json::Value::String("http".to_string()),
@@ -527,17 +546,53 @@ impl ConfigGenerator for ClaudeConfigGenerator {
                             server_def
                                 .insert("headers".to_string(), serde_json::Value::Object(headers));
                         }
+                        if *auto_allow {
+                            server_def
+                                .insert("autoAllow".to_string(), serde_json::Value::Bool(true));
+                        }
                     }
                 }
                 servers.insert(name.clone(), serde_json::Value::Object(server_def));
             }
             user_map.insert("mcpServers".to_string(), serde_json::Value::Object(servers));
-
-            results.push((
-                self.user_config_path.clone(),
-                serde_json::to_string_pretty(&user_map)?,
-            ));
         }
+
+        let enabled_tools = expand_tools(prefs);
+        let mut allowed_tools_vec = Vec::new();
+
+        for (tool, enabled) in enabled_tools {
+            if enabled {
+                if tool.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                     && !["Read", "Write", "Edit", "Glob", "Search", "WebFetch", "WebSearch"].contains(&tool.as_str())
+                {
+                    allowed_tools_vec.push(format!("Bash({}:)", tool));
+                }
+            }
+        }
+
+        if !allowed_tools_vec.is_empty() {
+             let projects_obj = user_map
+                .entry("projects".to_string())
+                .or_insert(serde_json::Value::Object(serde_json::Map::new()));
+
+            if let Some(projects_map) = projects_obj.as_object_mut() {
+                let project_key = self.project_path.to_string_lossy().to_string();
+                let project_entry = projects_map
+                    .entry(project_key)
+                    .or_insert(serde_json::Value::Object(serde_json::Map::new()));
+                
+                if let Some(project_map) = project_entry.as_object_mut() {
+                    project_map.insert("allowedTools".to_string(), serde_json::Value::Array(
+                        allowed_tools_vec.into_iter().map(serde_json::Value::String).collect()
+                    ));
+                }
+            }
+        }
+        
+        results.push((
+            self.user_config_path.clone(),
+            serde_json::to_string_pretty(&user_map)?,
+        ));
 
         Ok(results)
     }
@@ -593,7 +648,13 @@ impl ConfigGenerator for GeminiConfigGenerator {
         for (name, config) in &prefs.mcp_servers {
             let mut server_def = serde_json::Map::new();
             match config {
-                McpServerConfig::Stdio { command, args, env, .. } => {
+                McpServerConfig::Stdio {
+                    command,
+                    args,
+                    env,
+                    auto_allow,
+                    ..
+                } => {
                     server_def.insert(
                         "command".to_string(),
                         serde_json::Value::String(command.clone()),
@@ -607,15 +668,31 @@ impl ConfigGenerator for GeminiConfigGenerator {
                         ),
                     );
                     server_def.insert("env".to_string(), serde_json::to_value(env)?);
+                    if *auto_allow {
+                        server_def
+                            .insert("autoAllow".to_string(), serde_json::Value::Bool(true));
+                    }
                 }
-                McpServerConfig::Sse { url, .. } => {
+                McpServerConfig::Sse {
+                    url,
+                    auto_allow,
+                    ..
+                } => {
                     server_def.insert("url".to_string(), serde_json::Value::String(url.clone()));
                     if let Some(headers) = get_auth_headers(config, credentials) {
                         server_def
                             .insert("headers".to_string(), serde_json::Value::Object(headers));
                     }
+                    if *auto_allow {
+                        server_def
+                            .insert("autoAllow".to_string(), serde_json::Value::Bool(true));
+                    }
                 }
-                McpServerConfig::Http { http_url, .. } => {
+                McpServerConfig::Http {
+                    http_url,
+                    auto_allow,
+                    ..
+                } => {
                     server_def.insert(
                         "httpUrl".to_string(),
                         serde_json::Value::String(http_url.clone()),
@@ -623,6 +700,10 @@ impl ConfigGenerator for GeminiConfigGenerator {
                     if let Some(headers) = get_auth_headers(config, credentials) {
                         server_def
                             .insert("headers".to_string(), serde_json::Value::Object(headers));
+                    }
+                    if *auto_allow {
+                        server_def
+                            .insert("autoAllow".to_string(), serde_json::Value::Bool(true));
                     }
                 }
             }

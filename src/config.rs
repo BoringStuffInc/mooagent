@@ -342,6 +342,7 @@ impl ConfigPaths {
             Box::new(crate::preferences::ClaudeConfigGenerator {
                 config_dir: home.join(".claude"),
                 user_config_path: home.join(".claude.json"),
+                project_path: self.config_file.parent().unwrap_or(Path::new(".")).to_path_buf(),
             }),
             Box::new(crate::preferences::GeminiConfigGenerator {
                 config_dir: home.join(".gemini"),
@@ -401,6 +402,7 @@ impl ConfigPaths {
             Box::new(crate::preferences::ClaudeConfigGenerator {
                 config_dir: home.join(".claude"),
                 user_config_path: home.join(".claude.json"),
+                project_path: self.config_file.parent().unwrap_or(Path::new(".")).to_path_buf(),
             }),
             Box::new(crate::preferences::GeminiConfigGenerator {
                 config_dir: home.join(".gemini"),

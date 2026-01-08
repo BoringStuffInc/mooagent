@@ -1148,7 +1148,7 @@ fn render_mcp_servers(f: &mut Frame, app: &App) {
             if is_disabled {
                 details.push(Line::from(""));
                 details.push(Line::from(vec![Span::styled(
-                    "⚠️  Disabled in current project",
+                    "DISABLED in current project",
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 )]));
             }

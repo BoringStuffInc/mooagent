@@ -26,11 +26,10 @@ mod tests {
         )
         .unwrap();
 
-        let user_config_path = dir.path().join(".claude.json");
-
         let generator = crate::preferences::ClaudeConfigGenerator {
             config_dir: config_dir.clone(),
             user_config_path: user_config_path.clone(),
+            project_path: dir.path().to_path_buf(),
         };
 
         let mut prefs = crate::preferences::AgentPreferences::default();
@@ -76,6 +75,7 @@ mod tests {
         let generator = crate::preferences::ClaudeConfigGenerator {
             config_dir: config_dir.clone(),
             user_config_path: user_config_path.clone(),
+            project_path: dir.path().to_path_buf(),
         };
 
         let mut prefs = crate::preferences::AgentPreferences::default();

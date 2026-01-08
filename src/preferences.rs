@@ -42,17 +42,29 @@ pub enum McpServerConfig {
         args: Vec<String>,
         #[serde(default)]
         env: HashMap<String, String>,
+        #[serde(default)]
+        disabled_tools: Vec<String>,
+        #[serde(default)]
+        auto_allow: bool,
     },
     Sse {
         url: String,
         #[serde(default, skip_serializing_if = "McpAuth::is_none")]
         auth: McpAuth,
+        #[serde(default)]
+        disabled_tools: Vec<String>,
+        #[serde(default)]
+        auto_allow: bool,
     },
     Http {
         #[serde(rename = "httpUrl")]
         http_url: String,
         #[serde(default, skip_serializing_if = "McpAuth::is_none")]
         auth: McpAuth,
+        #[serde(default)]
+        disabled_tools: Vec<String>,
+        #[serde(default)]
+        auto_allow: bool,
     },
 }
 
@@ -76,6 +88,22 @@ impl McpServerConfig {
 
     pub fn requires_oauth(&self) -> bool {
         self.auth().map(|a| a.requires_oauth()).unwrap_or(false)
+    }
+
+    pub fn disabled_tools(&self) -> &[String] {
+        match self {
+            McpServerConfig::Stdio { disabled_tools, .. } => disabled_tools,
+            McpServerConfig::Sse { disabled_tools, .. } => disabled_tools,
+            McpServerConfig::Http { disabled_tools, .. } => disabled_tools,
+        }
+    }
+
+    pub fn auto_allow(&self) -> bool {
+        match self {
+            McpServerConfig::Stdio { auto_allow, .. } => *auto_allow,
+            McpServerConfig::Sse { auto_allow, .. } => *auto_allow,
+            McpServerConfig::Http { auto_allow, .. } => *auto_allow,
+        }
     }
 }
 
@@ -144,8 +172,8 @@ fn get_auth_headers(
     credentials: Option<&CredentialManager>,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
     let (url, auth) = match config {
-        McpServerConfig::Sse { url, auth } => (url, auth),
-        McpServerConfig::Http { http_url, auth } => (http_url, auth),
+        McpServerConfig::Sse { url, auth, .. } => (url, auth),
+        McpServerConfig::Http { http_url, auth, .. } => (http_url, auth),
         McpServerConfig::Stdio { .. } => return None,
     };
 
@@ -455,7 +483,7 @@ impl ConfigGenerator for ClaudeConfigGenerator {
             for (name, config) in &prefs.mcp_servers {
                 let mut server_def = serde_json::Map::new();
                 match config {
-                    McpServerConfig::Stdio { command, args, env } => {
+                    McpServerConfig::Stdio { command, args, env, .. } => {
                         server_def.insert(
                             "type".to_string(),
                             serde_json::Value::String("stdio".to_string()),
@@ -565,7 +593,7 @@ impl ConfigGenerator for GeminiConfigGenerator {
         for (name, config) in &prefs.mcp_servers {
             let mut server_def = serde_json::Map::new();
             match config {
-                McpServerConfig::Stdio { command, args, env } => {
+                McpServerConfig::Stdio { command, args, env, .. } => {
                     server_def.insert(
                         "command".to_string(),
                         serde_json::Value::String(command.clone()),
@@ -603,7 +631,15 @@ impl ConfigGenerator for GeminiConfigGenerator {
         settings_map.insert("mcpServers".to_string(), serde_json::Value::Object(servers));
         results.push((settings_path, serde_json::to_string_pretty(&settings_map)?));
 
-        let enabled_tools = expand_tools(prefs);
+        let mut enabled_tools = expand_tools(prefs);
+
+        // Apply disabled tools from MCP servers
+        for config in prefs.mcp_servers.values() {
+            for tool in config.disabled_tools() {
+                enabled_tools.insert(tool.clone(), false);
+            }
+        }
+
         let tools_path = self.config_dir.join("tools.json");
         let mut tools_map = read_json_or_empty(&tools_path);
 
@@ -645,7 +681,13 @@ impl ConfigGenerator for OpenCodeConfigGenerator {
         for (name, config) in &prefs.mcp_servers {
             let mut server_def = serde_json::Map::new();
             match config {
-                McpServerConfig::Stdio { command, args, env } => {
+                McpServerConfig::Stdio {
+                    command,
+                    args,
+                    env,
+                    auto_allow,
+                    ..
+                } => {
                     server_def.insert(
                         "type".to_string(),
                         serde_json::Value::String("local".to_string()),
@@ -656,8 +698,16 @@ impl ConfigGenerator for OpenCodeConfigGenerator {
                     if !env.is_empty() {
                         server_def.insert("environment".to_string(), serde_json::to_value(env)?);
                     }
+                    if *auto_allow {
+                        server_def
+                            .insert("autoAllow".to_string(), serde_json::Value::Bool(true));
+                    }
                 }
-                McpServerConfig::Sse { url, .. } => {
+                McpServerConfig::Sse {
+                    url,
+                    auto_allow,
+                    ..
+                } => {
                     server_def.insert(
                         "type".to_string(),
                         serde_json::Value::String("remote".to_string()),
@@ -667,8 +717,16 @@ impl ConfigGenerator for OpenCodeConfigGenerator {
                         server_def
                             .insert("headers".to_string(), serde_json::Value::Object(headers));
                     }
+                    if *auto_allow {
+                        server_def
+                            .insert("autoAllow".to_string(), serde_json::Value::Bool(true));
+                    }
                 }
-                McpServerConfig::Http { http_url, .. } => {
+                McpServerConfig::Http {
+                    http_url,
+                    auto_allow,
+                    ..
+                } => {
                     server_def.insert(
                         "type".to_string(),
                         serde_json::Value::String("remote".to_string()),
@@ -681,13 +739,25 @@ impl ConfigGenerator for OpenCodeConfigGenerator {
                         server_def
                             .insert("headers".to_string(), serde_json::Value::Object(headers));
                     }
+                    if *auto_allow {
+                        server_def
+                            .insert("autoAllow".to_string(), serde_json::Value::Bool(true));
+                    }
                 }
             }
             mcp_servers.insert(name.clone(), serde_json::Value::Object(server_def));
         }
         config_map.insert("mcp".to_string(), serde_json::Value::Object(mcp_servers));
 
-        let enabled_tools = expand_tools(prefs);
+        let mut enabled_tools = expand_tools(prefs);
+
+        // Apply disabled tools from MCP servers
+        for config in prefs.mcp_servers.values() {
+            for tool in config.disabled_tools() {
+                enabled_tools.insert(tool.clone(), false);
+            }
+        }
+
         if !enabled_tools.is_empty() {
             let tools_obj = config_map
                 .entry("tools".to_string())

@@ -906,22 +906,22 @@ fn render_presets_panel(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         });
 
     let mut lines = Vec::new();
-    let mgr = &app.paths.preferences;
 
     for (idx, preset) in app.pref_editor_state.preset_list.iter().enumerate() {
-        let enabled = mgr
-            .global_prefs
-            .tool_presets
-            .get(preset)
-            .map(|g| g.enabled)
-            .unwrap_or(false);
-        let check = if enabled { "[x]" } else { "[ ]" };
+        let state = app.get_preset_state(preset);
+        let check = match state {
+            crate::app::PresetState::All => "[x]",
+            crate::app::PresetState::None => "[ ]",
+            crate::app::PresetState::Partial => "[-]",
+        };
+
         let style = if is_focused && idx == app.pref_editor_state.selected_preset {
             Style::default().fg(Color::Black).bg(Color::Cyan)
-        } else if enabled {
-            Style::default().fg(Color::Green)
         } else {
-            Style::default().fg(Color::DarkGray)
+            match state {
+                crate::app::PresetState::None => Style::default().fg(Color::DarkGray),
+                _ => Style::default().fg(Color::Green),
+            }
         };
 
         lines.push(Line::from(vec![Span::styled(
@@ -947,12 +947,29 @@ fn render_tools_panel(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let mut lines = Vec::new();
     let mgr = &app.paths.preferences;
 
+    let mut section = "";
+
     for (idx, tool) in app
         .pref_editor_state
         .individual_tool_list
         .iter()
         .enumerate()
     {
+        let is_llm = crate::app::is_llm_tool(tool);
+        let current_section = if is_llm {
+            "LLM Specific"
+        } else {
+            "Regular Programs"
+        };
+
+        if current_section != section {
+            lines.push(Line::from(vec![Span::styled(
+                format!("--- {} ---", current_section),
+                Style::default().fg(Color::Blue),
+            )]));
+            section = current_section;
+        }
+
         let enabled = *mgr
             .global_prefs
             .individual_tools
@@ -1139,7 +1156,13 @@ fn render_mcp_servers(f: &mut Frame, app: &App) {
             details.push(Line::from(""));
 
             match config {
-                crate::preferences::McpServerConfig::Stdio { command, args, env } => {
+                crate::preferences::McpServerConfig::Stdio {
+                    command,
+                    args,
+                    env,
+                    disabled_tools,
+                    auto_allow,
+                } => {
                     details.push(Line::from(vec![
                         Span::styled("Type: ", Style::default().add_modifier(Modifier::BOLD)),
                         Span::styled("local (stdio)", Style::default().fg(Color::Green)),
@@ -1170,8 +1193,32 @@ fn render_mcp_servers(f: &mut Frame, app: &App) {
                         }
                         details.push(Line::from(""));
                     }
+
+                    if *auto_allow {
+                        details.push(Line::from(vec![Span::styled(
+                            "Auto-allow tools: Yes",
+                            Style::default().fg(Color::Yellow),
+                        )]));
+                        details.push(Line::from(""));
+                    }
+
+                    if !disabled_tools.is_empty() {
+                        details.push(Line::from(vec![Span::styled(
+                            "Disabled Tools:",
+                            Style::default().add_modifier(Modifier::BOLD),
+                        )]));
+                        for tool in disabled_tools {
+                            details.push(Line::from(format!("  - {}", tool)));
+                        }
+                        details.push(Line::from(""));
+                    }
                 }
-                crate::preferences::McpServerConfig::Sse { url, auth } => {
+                crate::preferences::McpServerConfig::Sse {
+                    url,
+                    auth,
+                    disabled_tools,
+                    auto_allow,
+                } => {
                     details.push(Line::from(vec![
                         Span::styled("Type: ", Style::default().add_modifier(Modifier::BOLD)),
                         Span::styled("remote (SSE)", Style::default().fg(Color::Blue)),
@@ -1185,8 +1232,32 @@ fn render_mcp_servers(f: &mut Frame, app: &App) {
 
                     format_auth_details(&mut details, auth);
                     format_oauth_status(&mut details, app, url, auth);
+
+                    if *auto_allow {
+                        details.push(Line::from(vec![Span::styled(
+                            "Auto-allow tools: Yes",
+                            Style::default().fg(Color::Yellow),
+                        )]));
+                        details.push(Line::from(""));
+                    }
+
+                    if !disabled_tools.is_empty() {
+                        details.push(Line::from(vec![Span::styled(
+                            "Disabled Tools:",
+                            Style::default().add_modifier(Modifier::BOLD),
+                        )]));
+                        for tool in disabled_tools {
+                            details.push(Line::from(format!("  - {}", tool)));
+                        }
+                        details.push(Line::from(""));
+                    }
                 }
-                crate::preferences::McpServerConfig::Http { http_url, auth } => {
+                crate::preferences::McpServerConfig::Http {
+                    http_url,
+                    auth,
+                    disabled_tools,
+                    auto_allow,
+                } => {
                     details.push(Line::from(vec![
                         Span::styled("Type: ", Style::default().add_modifier(Modifier::BOLD)),
                         Span::styled("remote (HTTP)", Style::default().fg(Color::Cyan)),
@@ -1200,6 +1271,25 @@ fn render_mcp_servers(f: &mut Frame, app: &App) {
 
                     format_auth_details(&mut details, auth);
                     format_oauth_status(&mut details, app, http_url, auth);
+
+                    if *auto_allow {
+                        details.push(Line::from(vec![Span::styled(
+                            "Auto-allow tools: Yes",
+                            Style::default().fg(Color::Yellow),
+                        )]));
+                        details.push(Line::from(""));
+                    }
+
+                    if !disabled_tools.is_empty() {
+                        details.push(Line::from(vec![Span::styled(
+                            "Disabled Tools:",
+                            Style::default().add_modifier(Modifier::BOLD),
+                        )]));
+                        for tool in disabled_tools {
+                            details.push(Line::from(format!("  - {}", tool)));
+                        }
+                        details.push(Line::from(""));
+                    }
                 }
             }
 

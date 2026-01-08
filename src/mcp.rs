@@ -453,6 +453,22 @@ fn get_tools_list() -> Vec<Value> {
 fn call_tool(name: &str, arguments: Value) -> Result<String> {
     let paths = ConfigPaths::new()?;
 
+    // Check permissions
+    let merged = paths.preferences.get_merged();
+    let enabled_tools = crate::preferences::expand_tools(&merged);
+
+    // 1. Check individual_tools/presets (explicitly disabled)
+    if enabled_tools.get(name) == Some(&false) {
+        return Err(anyhow::anyhow!("Tool '{}' is disabled by configuration", name));
+    }
+
+    // 2. Check disabled_tools in 'mooagent' MCP config
+    if let Some(config) = merged.mcp_servers.get("mooagent") {
+        if config.disabled_tools().contains(&name.to_string()) {
+            return Err(anyhow::anyhow!("Tool '{}' is disabled in mooagent MCP config", name));
+        }
+    }
+
     match name {
         "mcp_list" => {
             let merged = paths.preferences.get_merged();
@@ -468,7 +484,7 @@ fn call_tool(name: &str, arguments: Value) -> Result<String> {
             for (name, config) in servers {
                 result.push_str(&format!("- **{}**\n", name));
                 match config {
-                    McpServerConfig::Stdio { command, args, env } => {
+                    McpServerConfig::Stdio { command, args, env, .. } => {
                         result.push_str("  Type: local (stdio)\n");
                         result.push_str(&format!("  Command: {}\n", command));
                         if !args.is_empty() {
@@ -481,12 +497,12 @@ fn call_tool(name: &str, arguments: Value) -> Result<String> {
                             }
                         }
                     }
-                    McpServerConfig::Sse { url, auth } => {
+                    McpServerConfig::Sse { url, auth, .. } => {
                         result.push_str("  Type: remote (SSE)\n");
                         result.push_str(&format!("  URL: {}\n", url));
                         format_auth_status(&mut result, url, auth, &credentials);
                     }
-                    McpServerConfig::Http { http_url, auth } => {
+                    McpServerConfig::Http { http_url, auth, .. } => {
                         result.push_str("  Type: remote (HTTP)\n");
                         result.push_str(&format!("  URL: {}\n", http_url));
                         format_auth_status(&mut result, http_url, auth, &credentials);
@@ -514,6 +530,8 @@ fn call_tool(name: &str, arguments: Value) -> Result<String> {
                 McpServerConfig::Sse {
                     url: command.to_string(),
                     auth,
+                    disabled_tools: Vec::new(),
+                    auto_allow: false,
                 }
             } else {
                 let args: Vec<String> = arguments
@@ -540,6 +558,8 @@ fn call_tool(name: &str, arguments: Value) -> Result<String> {
                     command: command.to_string(),
                     args,
                     env,
+                    disabled_tools: Vec::new(),
+                    auto_allow: false,
                 }
             };
 
@@ -739,6 +759,8 @@ fn call_tool(name: &str, arguments: Value) -> Result<String> {
                     command: mooagent_path.to_string_lossy().to_string(),
                     args: vec!["--mcp".to_string()],
                     env: HashMap::new(),
+                    disabled_tools: Vec::new(),
+                    auto_allow: false,
                 },
             );
             paths.preferences.save_global()?;
@@ -784,8 +806,8 @@ fn call_tool(name: &str, arguments: Value) -> Result<String> {
                 .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found", name))?;
 
             let (url, auth) = match server {
-                McpServerConfig::Sse { url, auth } => (url.as_str(), auth),
-                McpServerConfig::Http { http_url, auth } => (http_url.as_str(), auth),
+                McpServerConfig::Sse { url, auth, .. } => (url.as_str(), auth),
+                McpServerConfig::Http { http_url, auth, .. } => (http_url.as_str(), auth),
                 McpServerConfig::Stdio { .. } => {
                     return Ok(format!(
                         "MCP server '{}' is a local (stdio) server - OAuth not applicable.",
@@ -846,8 +868,8 @@ fn call_tool(name: &str, arguments: Value) -> Result<String> {
                 .clone();
 
             let (url, auth) = match &server {
-                McpServerConfig::Sse { url, auth } => (url.clone(), auth.clone()),
-                McpServerConfig::Http { http_url, auth } => (http_url.clone(), auth.clone()),
+                McpServerConfig::Sse { url, auth, .. } => (url.clone(), auth.clone()),
+                McpServerConfig::Http { http_url, auth, .. } => (http_url.clone(), auth.clone()),
                 McpServerConfig::Stdio { .. } => {
                     return Err(anyhow::anyhow!(
                         "MCP server '{}' is a local (stdio) server - OAuth not applicable.",

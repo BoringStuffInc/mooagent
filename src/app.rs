@@ -80,6 +80,8 @@ pub enum McpFieldFocus {
     Command,
     Args,
     Env,
+    DisabledTools,
+    AutoAllow,
     AuthType,
     BearerToken,
     OAuthClientId,
@@ -97,6 +99,8 @@ pub struct McpEditorState {
     pub editing_command: String,
     pub editing_args: String,
     pub editing_env: String,
+    pub editing_disabled_tools: String,
+    pub editing_auto_allow: bool,
     pub focus: McpFieldFocus,
 
     pub editing_auth_type: McpAuthType,
@@ -123,25 +127,57 @@ impl Default for PreferenceEditorState {
                 "web_access".to_string(),
             ],
             individual_tool_list: vec![
+                // Regular Tools
                 "ls".to_string(),
                 "cd".to_string(),
                 "pwd".to_string(),
+                "cat".to_string(),
                 "grep".to_string(),
                 "find".to_string(),
+                "sed".to_string(),
+                "awk".to_string(),
+                "head".to_string(),
+                "tail".to_string(),
+                "sort".to_string(),
+                "uniq".to_string(),
+                "cp".to_string(),
+                "mv".to_string(),
+                "rm".to_string(),
+                "mkdir".to_string(),
+                "touch".to_string(),
+                "curl".to_string(),
+                "wget".to_string(),
+                "ping".to_string(),
+                "git".to_string(),
+                "npm".to_string(),
+                "cargo".to_string(),
+                "docker".to_string(),
+                "just".to_string(),
+                // LLM Tools
                 "Read".to_string(),
                 "Write".to_string(),
                 "Edit".to_string(),
                 "Glob".to_string(),
-                "curl".to_string(),
-                "wget".to_string(),
-                "git".to_string(),
-                "npm".to_string(),
-                "cargo".to_string(),
+                "Search".to_string(),
                 "WebFetch".to_string(),
                 "WebSearch".to_string(),
             ],
         }
     }
+}
+
+pub fn is_llm_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "Read" | "Write" | "Edit" | "Glob" | "Search" | "WebFetch" | "WebSearch"
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PresetState {
+    All,
+    None,
+    Partial,
 }
 
 impl Default for McpEditorState {
@@ -154,6 +190,8 @@ impl Default for McpEditorState {
             editing_command: String::new(),
             editing_args: String::new(),
             editing_env: String::new(),
+            editing_disabled_tools: String::new(),
+            editing_auto_allow: false,
             focus: McpFieldFocus::Name,
             editing_auth_type: McpAuthType::None,
             editing_bearer_token: String::new(),
@@ -219,6 +257,38 @@ pub struct App {
 }
 
 impl App {
+    pub fn get_preset_state(&self, preset_name: &str) -> PresetState {
+        let Some(tools) = crate::preferences::get_preset_tools(preset_name) else {
+            return PresetState::None;
+        };
+
+        let mut all_enabled = true;
+        let mut any_enabled = false;
+
+        for tool in tools {
+            let enabled = *self
+                .paths
+                .preferences
+                .global_prefs
+                .individual_tools
+                .get(tool)
+                .unwrap_or(&false);
+
+            if enabled {
+                any_enabled = true;
+            } else {
+                all_enabled = false;
+            }
+        }
+
+        if all_enabled {
+            PresetState::All
+        } else if any_enabled {
+            PresetState::Partial
+        } else {
+            PresetState::None
+        }
+    }
     pub fn new(event_rx: Option<Receiver<()>>) -> Result<Self> {
         let paths = ConfigPaths::new()?;
         paths.ensure_files_exist()?;
@@ -334,6 +404,8 @@ impl App {
         self.mcp_editor_state.editing_command.clear();
         self.mcp_editor_state.editing_args.clear();
         self.mcp_editor_state.editing_env.clear();
+        self.mcp_editor_state.editing_disabled_tools.clear();
+        self.mcp_editor_state.editing_auto_allow = false;
         self.mcp_editor_state.clear_auth_fields();
         self.mcp_editor_state.focus = McpFieldFocus::Name;
         self.mode = AppMode::EditMcp;
@@ -360,10 +432,12 @@ impl App {
 
         self.mcp_editor_state.is_new = false;
         self.mcp_editor_state.editing_name = server_name;
+        self.mcp_editor_state.editing_disabled_tools = config.disabled_tools().join(", ");
+        self.mcp_editor_state.editing_auto_allow = config.auto_allow();
         self.mcp_editor_state.clear_auth_fields();
 
         match &config {
-            McpServerConfig::Stdio { command, args, env } => {
+            McpServerConfig::Stdio { command, args, env, .. } => {
                 self.mcp_editor_state.editing_command = command.clone();
                 self.mcp_editor_state.editing_args = args.join(" ");
                 self.mcp_editor_state.editing_env = env
@@ -372,13 +446,13 @@ impl App {
                     .collect::<Vec<_>>()
                     .join(",");
             }
-            McpServerConfig::Sse { url, auth } => {
+            McpServerConfig::Sse { url, auth, .. } => {
                 self.mcp_editor_state.editing_command = url.clone();
                 self.mcp_editor_state.editing_args.clear();
                 self.mcp_editor_state.editing_env.clear();
                 self.populate_auth_fields(auth);
             }
-            McpServerConfig::Http { http_url, auth } => {
+            McpServerConfig::Http { http_url, auth, .. } => {
                 self.mcp_editor_state.editing_command = http_url.clone();
                 self.mcp_editor_state.editing_args.clear();
                 self.mcp_editor_state.editing_env.clear();
@@ -486,6 +560,16 @@ impl App {
             }
         }
 
+        let disabled_tools: Vec<String> = self
+            .mcp_editor_state
+            .editing_disabled_tools
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let auto_allow = self.mcp_editor_state.editing_auto_allow;
+
         if name.is_empty() || command.is_empty() {
             self.set_status("Name and Command/URL are required".to_string());
             return;
@@ -495,7 +579,12 @@ impl App {
             let auth = self.build_auth_config();
             let requires_oauth = auth.requires_oauth();
 
-            let config = McpServerConfig::Sse { url: command, auth };
+            let config = McpServerConfig::Sse {
+                url: command,
+                auth,
+                disabled_tools,
+                auto_allow,
+            };
 
             self.paths
                 .preferences
@@ -517,7 +606,13 @@ impl App {
             }
             return;
         } else {
-            McpServerConfig::Stdio { command, args, env }
+            McpServerConfig::Stdio {
+                command,
+                args,
+                env,
+                disabled_tools,
+                auto_allow,
+            }
         };
 
         self.paths
@@ -611,6 +706,8 @@ impl App {
                         command: cmd.to_string(),
                         args: args.iter().map(|s| s.to_string()).collect(),
                         env: std::collections::HashMap::new(),
+                        disabled_tools: Vec::new(),
+                        auto_allow: false,
                     },
                 );
                 added_count += 1;
@@ -628,6 +725,8 @@ impl App {
                     command: mooagent_path.to_string_lossy().to_string(),
                     args: vec!["--mcp".to_string()],
                     env: std::collections::HashMap::new(),
+                    disabled_tools: Vec::new(),
+                    auto_allow: false,
                 },
             );
             added_count += 1;
@@ -657,13 +756,21 @@ impl App {
             McpFieldFocus::Name => McpFieldFocus::Command,
             McpFieldFocus::Command => {
                 if is_remote {
-                    McpFieldFocus::AuthType
+                    McpFieldFocus::DisabledTools
                 } else {
                     McpFieldFocus::Args
                 }
             }
             McpFieldFocus::Args => McpFieldFocus::Env,
-            McpFieldFocus::Env => McpFieldFocus::Name,
+            McpFieldFocus::Env => McpFieldFocus::DisabledTools,
+            McpFieldFocus::DisabledTools => McpFieldFocus::AutoAllow,
+            McpFieldFocus::AutoAllow => {
+                if is_remote {
+                    McpFieldFocus::AuthType
+                } else {
+                    McpFieldFocus::Name
+                }
+            }
             McpFieldFocus::AuthType => match auth_type {
                 McpAuthType::None => McpFieldFocus::Name,
                 McpAuthType::Bearer => McpFieldFocus::BearerToken,
@@ -697,6 +804,13 @@ impl App {
             McpFieldFocus::Command => self.mcp_editor_state.editing_command.push(c),
             McpFieldFocus::Args => self.mcp_editor_state.editing_args.push(c),
             McpFieldFocus::Env => self.mcp_editor_state.editing_env.push(c),
+            McpFieldFocus::DisabledTools => self.mcp_editor_state.editing_disabled_tools.push(c),
+            McpFieldFocus::AutoAllow => {
+                if c == ' ' {
+                    self.mcp_editor_state.editing_auto_allow =
+                        !self.mcp_editor_state.editing_auto_allow;
+                }
+            }
             McpFieldFocus::AuthType => {
                 if c == ' ' || c == 'l' || c == 'j' {
                     self.mcp_cycle_auth_type(true);
@@ -738,6 +852,10 @@ impl App {
             McpFieldFocus::Env => {
                 let _ = self.mcp_editor_state.editing_env.pop();
             }
+            McpFieldFocus::DisabledTools => {
+                let _ = self.mcp_editor_state.editing_disabled_tools.pop();
+            }
+            McpFieldFocus::AutoAllow => {}
             McpFieldFocus::AuthType => {}
             McpFieldFocus::BearerToken => {
                 let _ = self.mcp_editor_state.editing_bearer_token.pop();
@@ -1103,26 +1221,45 @@ impl App {
     }
 
     pub fn pref_toggle_item(&mut self) {
-        let mgr = &mut self.paths.preferences;
-
         match self.pref_editor_state.focus {
             PrefEditorFocus::Presets => {
                 if let Some(preset_name) = self
                     .pref_editor_state
                     .preset_list
                     .get(self.pref_editor_state.selected_preset)
+                    .cloned()
                 {
-                    if let Some(group) = mgr.global_prefs.tool_presets.get_mut(preset_name) {
-                        group.enabled = !group.enabled;
+                    let current_state = self.get_preset_state(&preset_name);
+                    let target_state = match current_state {
+                        PresetState::All => false,
+                        _ => true,
+                    };
+
+                    let mgr = &mut self.paths.preferences;
+
+                    if let Some(tools) = crate::preferences::get_preset_tools(&preset_name) {
+                        for tool in tools {
+                            mgr.global_prefs
+                                .individual_tools
+                                .insert(tool.to_string(), target_state);
+                        }
+                    }
+
+                    // Also update the preset config itself, though individual tools take precedence
+                    if let Some(group) = mgr.global_prefs.tool_presets.get_mut(&preset_name) {
+                        group.enabled = target_state;
                     } else {
                         mgr.global_prefs.tool_presets.insert(
                             preset_name.clone(),
-                            crate::preferences::PresetGroup { enabled: true },
+                            crate::preferences::PresetGroup {
+                                enabled: target_state,
+                            },
                         );
                     }
                 }
             }
             PrefEditorFocus::IndividualTools => {
+                let mgr = &mut self.paths.preferences;
                 if let Some(tool_name) = self
                     .pref_editor_state
                     .individual_tool_list
@@ -1138,24 +1275,27 @@ impl App {
                         .insert(tool_name.clone(), !current);
                 }
             }
-            PrefEditorFocus::GeneralSettings => match self.pref_editor_state.selected_general {
-                0 => {
-                    let current = mgr.global_prefs.general.auto_accept_tools.unwrap_or(true);
-                    mgr.global_prefs.general.auto_accept_tools = Some(!current);
+            PrefEditorFocus::GeneralSettings => {
+                let mgr = &mut self.paths.preferences;
+                match self.pref_editor_state.selected_general {
+                    0 => {
+                        let current = mgr.global_prefs.general.auto_accept_tools.unwrap_or(true);
+                        mgr.global_prefs.general.auto_accept_tools = Some(!current);
+                    }
+                    1 => {
+                        let current = mgr.global_prefs.general.enable_logging.unwrap_or(true);
+                        mgr.global_prefs.general.enable_logging = Some(!current);
+                    }
+                    2 => {
+                        let current = mgr.global_prefs.general.sandboxed_mode.unwrap_or(true);
+                        mgr.global_prefs.general.sandboxed_mode = Some(!current);
+                    }
+                    _ => {}
                 }
-                1 => {
-                    let current = mgr.global_prefs.general.enable_logging.unwrap_or(true);
-                    mgr.global_prefs.general.enable_logging = Some(!current);
-                }
-                2 => {
-                    let current = mgr.global_prefs.general.sandboxed_mode.unwrap_or(true);
-                    mgr.global_prefs.general.sandboxed_mode = Some(!current);
-                }
-                _ => {}
-            },
+            }
         }
 
-        let _ = mgr.save_global();
+        let _ = self.paths.preferences.save_global();
         self.refresh();
     }
 
@@ -1226,10 +1366,12 @@ impl App {
             McpServerConfig::Sse {
                 url,
                 auth: McpAuth::OAuth { .. },
+                ..
             } => url,
             McpServerConfig::Http {
                 http_url,
                 auth: McpAuth::OAuth { .. },
+                ..
             } => http_url,
             _ => return None,
         };
@@ -1301,6 +1443,7 @@ impl App {
                         scopes,
                         auth_server_url,
                     },
+                ..
             } => Some(OAuthFlowConfig {
                 server_url: url.clone(),
                 client_id: client_id.clone(),
@@ -1317,6 +1460,7 @@ impl App {
                         scopes,
                         auth_server_url,
                     },
+                ..
             } => Some(OAuthFlowConfig {
                 server_url: http_url.clone(),
                 client_id: client_id.clone(),

@@ -11,6 +11,8 @@ pub enum AppMode {
     Help,
     ConfirmSync,
     ConfirmSyncAll,
+    ConfirmDeleteMcp,
+    ConfirmAutoSync,
     ViewDiff,
     ViewBackups,
     Search,
@@ -489,6 +491,13 @@ impl App {
         }
     }
 
+    pub fn mcp_confirm_delete(&mut self) {
+        if self.mcp_editor_state.server_list.is_empty() {
+            return;
+        }
+        self.mode = AppMode::ConfirmDeleteMcp;
+    }
+
     pub fn mcp_delete(&mut self) {
         if self.mcp_editor_state.server_list.is_empty() {
             return;
@@ -881,21 +890,26 @@ impl App {
 
     pub fn sync(&mut self) -> Result<()> {
         let agent_sync_result = self.paths.sync();
+        let global_sync_result = self.paths.sync_global_rules();
         let pref_sync_result = self.paths.sync_preferences();
 
-        match (agent_sync_result, pref_sync_result) {
-            (Ok(agent_msg), Ok(pref_msg)) => {
-                self.set_status(format!("{} | {}", agent_msg, pref_msg));
+        match (&agent_sync_result, &global_sync_result, &pref_sync_result) {
+            (Ok(agent_msg), Ok(_), Ok(pref_msg)) => {
+                self.set_status(format!("{} | Global rules synced | {}", agent_msg, pref_msg));
                 self.refresh();
                 Ok(())
             }
-            (Err(e), _) => {
+            (Err(e), _, _) => {
                 self.set_status(format!("Agent Sync Error: {}", e));
-                Err(e)
+                Err(anyhow::anyhow!("{}", e))
             }
-            (_, Err(e)) => {
+            (_, Err(e), _) => {
+                self.set_status(format!("Global Rules Sync Error: {}", e));
+                Err(anyhow::anyhow!("{}", e))
+            }
+            (_, _, Err(e)) => {
                 self.set_status(format!("Pref Sync Error: {}", e));
-                Err(e)
+                Err(anyhow::anyhow!("{}", e))
             }
         }
     }
@@ -1234,10 +1248,7 @@ impl App {
                     .cloned()
                 {
                     let current_state = self.get_preset_state(&preset_name);
-                    let target_state = match current_state {
-                        PresetState::All => false,
-                        _ => true,
-                    };
+                    let target_state = !matches!(current_state, PresetState::All);
 
                     let mgr = &mut self.paths.preferences;
 
@@ -1479,9 +1490,19 @@ impl App {
     pub fn store_oauth_token(&mut self, url: &str, token: crate::credentials::StoredToken) {
         match self.credentials.store_token(url, token) {
             Ok(()) => {
-                self.set_status(
-                    "OAuth login successful! Run sync to update agent configs.".to_string(),
-                );
+                match self.sync_preferences() {
+                    Ok(()) => {
+                        self.set_status(
+                            "OAuth login successful! Synced to all agents.".to_string(),
+                        );
+                    }
+                    Err(e) => {
+                        self.set_status(format!(
+                            "OAuth login successful, but sync failed: {}",
+                            e
+                        ));
+                    }
+                }
             }
             Err(e) => {
                 self.set_status(format!("Failed to store token: {}", e));

@@ -1,5 +1,5 @@
 use crate::app::{ActiveTab, App, AppMode, Focus, McpAuthType, McpFieldFocus, PrefEditorFocus};
-use crate::config::{AgentStatus, SyncStrategy};
+use crate::config::{AgentStatus, SyncState, SyncStrategy};
 use crate::credentials::TokenStatus;
 use crate::preferences::McpAuth;
 use ratatui::{
@@ -55,6 +55,7 @@ fn format_oauth_status(details: &mut Vec<Line<'_>>, app: &App, url: &str, auth: 
     }
 
     let status = app.credentials.token_status(url);
+    let token = app.credentials.get_token(url);
     details.push(Line::from(""));
 
     let (status_text, status_color) = match status {
@@ -68,6 +69,30 @@ fn format_oauth_status(details: &mut Vec<Line<'_>>, app: &App, url: &str, auth: 
         Span::styled("Status: ", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(status_text, Style::default().fg(status_color)),
     ]));
+
+    if let Some(token) = token
+        && let Some(expires_at) = token.expires_at
+    {
+        let now = chrono::Utc::now();
+        let expiry_text = if expires_at <= now {
+            "Expired".to_string()
+        } else {
+            let duration = expires_at - now;
+            let hours = duration.num_hours();
+            let minutes = duration.num_minutes() % 60;
+            if hours > 24 {
+                format!("in {}d {}h", hours / 24, hours % 24)
+            } else if hours > 0 {
+                format!("in {}h {}m", hours, minutes)
+            } else {
+                format!("in {}m", minutes)
+            }
+        };
+        details.push(Line::from(vec![
+            Span::styled("Expires: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(expiry_text),
+        ]));
+    }
 
     details.push(Line::from(""));
     match status {
@@ -137,7 +162,7 @@ pub fn render(f: &mut Frame, app: &App) {
             }
             return;
         }
-        AppMode::ConfirmSync | AppMode::ConfirmSyncAll => {
+        AppMode::ConfirmSync | AppMode::ConfirmSyncAll | AppMode::ConfirmDeleteMcp | AppMode::ConfirmAutoSync => {
             render_main(f, app);
             render_confirm_dialog(f, app);
             return;
@@ -201,15 +226,63 @@ fn render_main(f: &mut Frame, app: &App) {
 
     render_tabs(f, app, chunks[0]);
 
-    let drifted_agents = app.paths.check_global_rules_drift();
-    let sync_indicator = if drifted_agents.is_empty() {
-        Span::styled(" ✓", Style::default().fg(Color::Green))
+    let agents = &app.agents;
+    let global_drift = agents.iter().filter(|a| matches!(a.sync_status.global_rules, SyncState::Drift)).count();
+    let rules_drift = agents.iter().filter(|a| matches!(a.sync_status.rules, SyncState::Drift | SyncState::Missing)).count();
+    let prefs_drift = agents.iter().any(|a| matches!(a.sync_status.preferences, SyncState::Drift));
+    let mcp_drift = agents.iter().any(|a| matches!(a.sync_status.mcp_servers, SyncState::Drift));
+
+    let mut status_parts = Vec::new();
+    if global_drift > 0 {
+        status_parts.push(format!("Global: {} drift", global_drift));
+    }
+    if rules_drift > 0 {
+        status_parts.push(format!("Rules: {} drift", rules_drift));
+    }
+    if prefs_drift {
+        status_parts.push("Prefs: drift".to_string());
+    }
+    if mcp_drift {
+        status_parts.push("MCP: drift".to_string());
+    }
+
+    let sync_indicator = if status_parts.is_empty() {
+        Span::styled(" ✓ All synced", Style::default().fg(Color::Green))
     } else {
         Span::styled(
-            format!(" ⚠ {} agents out of sync", drifted_agents.len()),
+            format!(" ⚠ {}", status_parts.join(" | ")),
             Style::default().fg(Color::Yellow),
         )
     };
+
+    let mut title_spans = vec![Span::raw("MooAgent - Agent Context Manager")];
+    if app.auto_sync {
+        title_spans.push(Span::raw(" "));
+        title_spans.push(Span::styled(
+            "[AUTO-SYNC]",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if !app.search_query.is_empty() {
+        title_spans.push(Span::raw(" "));
+        title_spans.push(Span::styled(
+            format!("[SEARCH: {}]", app.search_query),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if app.show_error_log {
+        title_spans.push(Span::raw(" "));
+        title_spans.push(Span::styled(
+            "[LOG]",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
 
     let header = Paragraph::new(vec![
         Line::from(vec![
@@ -221,17 +294,17 @@ fn render_main(f: &mut Frame, app: &App) {
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "Unknown".to_string()),
             ),
+            sync_indicator,
         ]),
         Line::from(vec![
             Span::styled("Global: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(app.paths.global_rules_primary.display().to_string()),
-            sync_indicator,
         ]),
     ])
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title("MooAgent - Agent Context Manager"),
+            .title(Line::from(title_spans)),
     );
     f.render_widget(header, chunks[1]);
 
@@ -299,68 +372,116 @@ fn render_main(f: &mut Frame, app: &App) {
                 .iter()
                 .position(|a| a.name == agent.name)
                 .unwrap_or(0);
-            let (status_text, mut status_style) = match agent.status {
-                AgentStatus::Ok => ("OK", Style::default().fg(Color::Green)),
-                AgentStatus::Missing => ("MISSING", Style::default().fg(Color::Red)),
-                AgentStatus::Drift => ("DRIFT", Style::default().fg(Color::Yellow)),
-            };
+
             let strategy_text = match agent.strategy {
                 SyncStrategy::Merge => "Merge",
                 SyncStrategy::Symlink => "Symlink",
             };
 
-            if idx == app.selected_agent {
-                status_style = status_style.add_modifier(Modifier::REVERSED);
+            let is_selected = idx == app.selected_agent;
+
+            let mut row_style = match agent.status {
+                AgentStatus::Ok => Style::default(),
+                AgentStatus::Missing => Style::default().fg(Color::Red),
+                AgentStatus::Drift => Style::default().fg(Color::Yellow),
+            };
+
+            if is_selected {
+                row_style = row_style.add_modifier(Modifier::REVERSED);
             }
 
+            let name_display = if is_selected {
+                format!(">> {}", agent.name)
+            } else {
+                format!("   {}", agent.name)
+            };
+
             Row::new(vec![
-                agent.name.clone(),
-                status_text.to_string(),
+                name_display,
+                agent.sync_status.rules.symbol().to_string(),
+                agent.sync_status.global_rules.symbol().to_string(),
+                agent.sync_status.preferences.symbol().to_string(),
+                agent.sync_status.mcp_servers.symbol().to_string(),
                 strategy_text.to_string(),
-                agent
-                    .target_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "Unknown".to_string()),
             ])
-            .style(status_style)
+            .style(row_style)
         })
         .collect();
 
-    let table_title = match (app.focus == Focus::Agents, app.search_query.is_empty()) {
-        (true, true) => "Agent Status Audit (Focused)".to_string(),
-        (true, false) => format!(
-            "Agent Status Audit (Focused) (filtered: {})",
-            visible_agents.len()
-        ),
-        (false, true) => "Agent Status Audit".to_string(),
-        (false, false) => format!("Agent Status Audit (filtered: {})", visible_agents.len()),
-    };
+    if app.agents.is_empty() {
+        let welcome = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "No agents configured",
+                Style::default().add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(""),
+            Line::from("To get started:"),
+            Line::from(vec![
+                Span::raw("  1. Edit "),
+                Span::styled(".mooagent.toml", Style::default().fg(Color::Cyan)),
+                Span::raw(" to add agents"),
+            ]),
+            Line::from(vec![
+                Span::raw("  2. Press "),
+                Span::styled("[?]", Style::default().fg(Color::Yellow)),
+                Span::raw(" for help"),
+            ]),
+            Line::from(vec![
+                Span::raw("  3. Press "),
+                Span::styled("[Ctrl+c]", Style::default().fg(Color::Yellow)),
+                Span::raw(" to edit config file"),
+            ]),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Agent Status Audit")
+                .border_style(if app.focus == Focus::Agents {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                }),
+        );
+        f.render_widget(welcome, chunks[3]);
+    } else {
+        let table_title = match (app.focus == Focus::Agents, app.search_query.is_empty()) {
+            (true, true) => "Agent Status Audit (Focused)".to_string(),
+            (true, false) => format!(
+                "Agent Status Audit (Focused) (filtered: {})",
+                visible_agents.len()
+            ),
+            (false, true) => "Agent Status Audit".to_string(),
+            (false, false) => format!("Agent Status Audit (filtered: {})", visible_agents.len()),
+        };
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Min(10),
-        ],
-    )
-    .header(
-        Row::new(vec!["Agent", "Status", "Strategy", "Target File"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
-    )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(table_title)
-            .border_style(if app.focus == Focus::Agents {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default()
-            }),
-    );
-    f.render_widget(table, chunks[3]);
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(13),
+                Constraint::Length(6),
+                Constraint::Length(7),
+                Constraint::Length(6),
+                Constraint::Length(5),
+                Constraint::Length(8),
+            ],
+        )
+        .header(
+            Row::new(vec!["   Agent", "Rules", "Global", "Prefs", "MCP", "Strategy"])
+                .style(Style::default().add_modifier(Modifier::BOLD)),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(table_title)
+                .border_style(if app.focus == Focus::Agents {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                }),
+        );
+        f.render_widget(table, chunks[3]);
+    }
 
     if let Some((msg, _)) = &app.status_message {
         f.render_widget(
@@ -543,7 +664,6 @@ fn render_help(f: &mut Frame, app: &App) {
         Line::from("  Ctrl+g            - Edit global rules (syncs to all agents)"),
         Line::from("  Ctrl+e            - Edit project rules (AGENTS.md)"),
         Line::from("  Ctrl+c            - Edit config file (.mooagent.toml)"),
-        Line::from("  Ctrl+p            - Open Preference Editor (Tool permissions, MCP)"),
         Line::from("  a                 - Toggle auto-sync mode"),
         Line::from("  /                 - Search agents by name/path"),
         Line::from("  v                 - Toggle error/status log"),
@@ -587,6 +707,39 @@ fn render_help(f: &mut Frame, app: &App) {
         ]),
         Line::from(""),
         Line::from(vec![Span::styled(
+            "Config File Locations:",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![
+            Span::raw("  Project config:  "),
+            Span::styled(
+                app.paths.config_file.display().to_string(),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("  Project rules:   "),
+            Span::styled(
+                app.paths.project_agents.display().to_string(),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("  Global rules:    "),
+            Span::styled(
+                app.paths.global_rules_primary.display().to_string(),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("  MCP/Prefs:       "),
+            Span::styled(
+                app.paths.preferences.global_path.display().to_string(),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
             "Features:",
             Style::default().add_modifier(Modifier::BOLD),
         )]),
@@ -625,16 +778,29 @@ fn render_confirm_dialog(f: &mut Frame, app: &App) {
         height: popup_height,
     };
 
-    let message = match app.mode {
-        AppMode::ConfirmSyncAll => "Sync all agents?",
+    let (message, detail) = match app.mode {
+        AppMode::ConfirmSyncAll => ("Sync all agents?", "This will backup and overwrite existing files."),
         AppMode::ConfirmSync => {
             if app.agents.is_empty() {
-                "No agents to sync"
+                ("No agents to sync", "")
             } else {
-                "Sync selected agent?"
+                ("Sync selected agent?", "This will backup and overwrite existing files.")
             }
         }
-        _ => "Confirm?",
+        AppMode::ConfirmDeleteMcp => {
+            let server_name = app
+                .mcp_editor_state
+                .server_list
+                .get(app.mcp_editor_state.selected_server_idx)
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
+            return render_delete_confirm_dialog(f, popup_area, server_name);
+        }
+        AppMode::ConfirmAutoSync => (
+            "Enable auto-sync?",
+            "Files will sync automatically when changes are detected.",
+        ),
+        _ => ("Confirm?", ""),
     };
 
     let text = vec![
@@ -644,7 +810,7 @@ fn render_confirm_dialog(f: &mut Frame, app: &App) {
             Style::default().add_modifier(Modifier::BOLD),
         )]),
         Line::from(""),
-        Line::from("This will backup and overwrite existing files."),
+        Line::from(detail),
         Line::from(""),
         Line::from(vec![
             Span::styled("[y]", Style::default().fg(Color::Green)),
@@ -659,6 +825,40 @@ fn render_confirm_dialog(f: &mut Frame, app: &App) {
             Block::default()
                 .borders(Borders::ALL)
                 .title("Confirmation")
+                .style(Style::default().bg(Color::Black)),
+        )
+        .wrap(Wrap { trim: true });
+
+    f.render_widget(Clear, popup_area);
+    f.render_widget(dialog, popup_area);
+}
+
+fn render_delete_confirm_dialog(f: &mut Frame, popup_area: ratatui::layout::Rect, server_name: &str) {
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            format!("Delete MCP server '{}'?", server_name),
+            Style::default().add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "This action cannot be undone.",
+            Style::default().fg(Color::Red),
+        )]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[y]", Style::default().fg(Color::Green)),
+            Span::raw(" Yes   "),
+            Span::styled("[n/Esc]", Style::default().fg(Color::Red)),
+            Span::raw(" No"),
+        ]),
+    ];
+
+    let dialog = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Delete Confirmation")
                 .style(Style::default().bg(Color::Black)),
         )
         .wrap(Wrap { trim: true });
@@ -915,6 +1115,10 @@ fn render_presets_panel(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             crate::app::PresetState::Partial => "[-]",
         };
 
+        let tool_count = crate::preferences::get_preset_tools(preset)
+            .map(|t| t.len())
+            .unwrap_or(0);
+
         let style = if is_focused && idx == app.pref_editor_state.selected_preset {
             Style::default().fg(Color::Black).bg(Color::Cyan)
         } else {
@@ -925,7 +1129,7 @@ fn render_presets_panel(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         };
 
         lines.push(Line::from(vec![Span::styled(
-            format!("{} {}", check, preset),
+            format!("{} {} [{}]", check, preset, tool_count),
             style,
         )]));
     }

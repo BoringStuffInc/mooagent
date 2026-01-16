@@ -108,6 +108,16 @@ impl McpServerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ToolPermissions {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub ask: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentPreferences {
     #[serde(default)]
     pub general: GeneralPreferences,
@@ -115,6 +125,8 @@ pub struct AgentPreferences {
     pub tool_presets: HashMap<String, PresetGroup>,
     #[serde(default)]
     pub individual_tools: HashMap<String, bool>,
+    #[serde(default)]
+    pub tool_permissions: ToolPermissions,
     #[serde(default)]
     pub mcp_servers: HashMap<String, McpServerConfig>,
     #[serde(default)]
@@ -333,6 +345,7 @@ impl PreferenceManager {
             },
             tool_presets,
             individual_tools: HashMap::new(),
+            tool_permissions: ToolPermissions::default(),
             mcp_servers: HashMap::new(),
             disabled_mcp_servers: Vec::new(),
             agent_specific: HashMap::new(),
@@ -431,7 +444,6 @@ fn read_json_or_empty(path: &Path) -> serde_json::Map<String, serde_json::Value>
 pub struct ClaudeConfigGenerator {
     pub config_dir: PathBuf,
     pub user_config_path: PathBuf,
-    pub project_path: PathBuf,
 }
 
 impl ConfigGenerator for ClaudeConfigGenerator {
@@ -445,15 +457,12 @@ impl ConfigGenerator for ClaudeConfigGenerator {
         credentials: Option<&CredentialManager>,
     ) -> Result<Vec<(PathBuf, String)>> {
         let agent_prefs = prefs.agent_specific.get("Claude");
-
         let mut results = Vec::new();
 
-        if let Some(ap) = agent_prefs
-            && (!ap.ui_settings.is_empty() || !ap.plugins.is_empty())
-        {
-            let settings_path = self.config_dir.join("settings.json");
-            let mut settings_map = read_json_or_empty(&settings_path);
+        let settings_path = self.config_dir.join("settings.json");
+        let mut settings_map = read_json_or_empty(&settings_path);
 
+        if let Some(ap) = agent_prefs {
             for (k, v) in &ap.ui_settings {
                 settings_map.insert(k.clone(), v.clone());
             }
@@ -469,9 +478,55 @@ impl ConfigGenerator for ClaudeConfigGenerator {
                     }
                 }
             }
-
-            results.push((settings_path, serde_json::to_string_pretty(&settings_map)?));
         }
+
+        let permissions = build_claude_permissions(prefs);
+        let mut perm_map = serde_json::Map::new();
+
+        if !permissions.allow.is_empty() {
+            perm_map.insert(
+                "allow".to_string(),
+                serde_json::Value::Array(
+                    permissions
+                        .allow
+                        .iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
+        }
+
+        if !permissions.ask.is_empty() {
+            perm_map.insert(
+                "ask".to_string(),
+                serde_json::Value::Array(
+                    permissions
+                        .ask
+                        .iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
+        }
+
+        if !permissions.deny.is_empty() {
+            perm_map.insert(
+                "deny".to_string(),
+                serde_json::Value::Array(
+                    permissions
+                        .deny
+                        .iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
+        }
+
+        if !perm_map.is_empty() {
+            settings_map.insert("permissions".to_string(), serde_json::Value::Object(perm_map));
+        }
+
+        results.push((settings_path, serde_json::to_string_pretty(&settings_map)?));
 
         let mut user_map = read_json_or_empty(&self.user_config_path);
 
@@ -557,38 +612,6 @@ impl ConfigGenerator for ClaudeConfigGenerator {
             user_map.insert("mcpServers".to_string(), serde_json::Value::Object(servers));
         }
 
-        let enabled_tools = expand_tools(prefs);
-        let mut allowed_tools_vec = Vec::new();
-
-        for (tool, enabled) in enabled_tools {
-            if enabled {
-                if tool.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
-                     && !["Read", "Write", "Edit", "Glob", "Search", "WebFetch", "WebSearch"].contains(&tool.as_str())
-                {
-                    allowed_tools_vec.push(format!("Bash({}:)", tool));
-                }
-            }
-        }
-
-        if !allowed_tools_vec.is_empty() {
-             let projects_obj = user_map
-                .entry("projects".to_string())
-                .or_insert(serde_json::Value::Object(serde_json::Map::new()));
-
-            if let Some(projects_map) = projects_obj.as_object_mut() {
-                let project_key = self.project_path.to_string_lossy().to_string();
-                let project_entry = projects_map
-                    .entry(project_key)
-                    .or_insert(serde_json::Value::Object(serde_json::Map::new()));
-                
-                if let Some(project_map) = project_entry.as_object_mut() {
-                    project_map.insert("allowedTools".to_string(), serde_json::Value::Array(
-                        allowed_tools_vec.into_iter().map(serde_json::Value::String).collect()
-                    ));
-                }
-            }
-        }
-        
         results.push((
             self.user_config_path.clone(),
             serde_json::to_string_pretty(&user_map)?,
@@ -596,6 +619,70 @@ impl ConfigGenerator for ClaudeConfigGenerator {
 
         Ok(results)
     }
+}
+
+fn build_claude_permissions(prefs: &AgentPreferences) -> ToolPermissions {
+    let mut result = ToolPermissions::default();
+
+    result.allow.extend(prefs.tool_permissions.allow.clone());
+    result.ask.extend(prefs.tool_permissions.ask.clone());
+    result.deny.extend(prefs.tool_permissions.deny.clone());
+
+    let enabled_tools = expand_tools(prefs);
+    for (tool, enabled) in &enabled_tools {
+        if let Some(pattern) = format_tool_permission(tool)
+            && *enabled
+            && !result.allow.contains(&pattern)
+            && !result.ask.contains(&pattern)
+            && !result.deny.contains(&pattern)
+        {
+            result.allow.push(pattern);
+        }
+    }
+
+    for (server_name, config) in &prefs.mcp_servers {
+        if config.auto_allow() {
+            let pattern = format!("mcp__{}__*", server_name);
+            if !result.allow.contains(&pattern) {
+                result.allow.push(pattern);
+            }
+        }
+
+        for tool in config.disabled_tools() {
+            let pattern = format!("mcp__{}__{}", server_name, tool);
+            if !result.deny.contains(&pattern) {
+                result.deny.push(pattern);
+            }
+        }
+    }
+
+    result.allow.sort();
+    result.ask.sort();
+    result.deny.sort();
+
+    result
+}
+
+fn format_tool_permission(tool: &str) -> Option<String> {
+    // Only generate permissions for Bash commands - these use prefix matching with :*
+    // Other tools either:
+    // - Don't need permissions (Glob, Grep - read-only)
+    // - Don't support wildcards (WebSearch)
+    // - Need specific patterns users should configure manually (Read, Edit, WebFetch)
+    // - Are internal/special (Task, TodoWrite, etc.)
+
+    let skip_tools = [
+        "Read", "Write", "Edit", "Glob", "Grep", "Search",
+        "WebFetch", "WebSearch", "Task", "TodoWrite",
+        "NotebookEdit", "LSP", "AskFollowupQuestion",
+    ];
+
+    if skip_tools.contains(&tool) {
+        return None;
+    }
+
+    // For regular CLI tools, generate Bash permission with prefix matching
+    Some(format!("Bash({}:*)", tool))
 }
 
 pub struct GeminiConfigGenerator {

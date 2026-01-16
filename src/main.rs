@@ -203,6 +203,26 @@ where
                         }
                         _ => {}
                     },
+                    AppMode::ConfirmDeleteMcp => match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            app.mcp_delete();
+                            app.mode = AppMode::Normal;
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            app.mode = AppMode::Normal;
+                        }
+                        _ => {}
+                    },
+                    AppMode::ConfirmAutoSync => match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            app.toggle_auto_sync();
+                            app.mode = AppMode::Normal;
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            app.mode = AppMode::Normal;
+                        }
+                        _ => {}
+                    },
                     AppMode::Normal => {
                         if !app.show_error_log {
                             match key.code {
@@ -287,7 +307,7 @@ where
             app.mcp_start_edit();
         }
         KeyCode::Char('d') => {
-            app.mcp_delete();
+            app.mcp_confirm_delete();
         }
         KeyCode::Char(' ') => {
             app.mcp_toggle_enabled();
@@ -518,7 +538,11 @@ where
             }
 
             KeyCode::Char('a') => {
-                app.toggle_auto_sync();
+                if app.auto_sync {
+                    app.toggle_auto_sync();
+                } else {
+                    app.mode = AppMode::ConfirmAutoSync;
+                }
             }
 
             KeyCode::Char('/') => {

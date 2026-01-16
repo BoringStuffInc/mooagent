@@ -25,6 +25,54 @@ pub enum AgentStatus {
     Drift,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
+pub enum SyncState {
+    #[default]
+    Ok,
+    Missing,
+    Drift,
+    NotApplicable,
+}
+
+impl SyncState {
+    pub fn symbol(&self) -> &'static str {
+        match self {
+            SyncState::Ok => "✓",
+            SyncState::Missing => "✗",
+            SyncState::Drift => "⚡",
+            SyncState::NotApplicable => "-",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AgentSyncStatus {
+    pub rules: SyncState,
+    pub global_rules: SyncState,
+    pub preferences: SyncState,
+    pub mcp_servers: SyncState,
+}
+
+impl AgentSyncStatus {
+    pub fn overall(&self) -> AgentStatus {
+        if matches!(self.rules, SyncState::Missing)
+            || matches!(self.global_rules, SyncState::Missing)
+            || matches!(self.preferences, SyncState::Missing)
+            || matches!(self.mcp_servers, SyncState::Missing)
+        {
+            AgentStatus::Missing
+        } else if matches!(self.rules, SyncState::Drift)
+            || matches!(self.global_rules, SyncState::Drift)
+            || matches!(self.preferences, SyncState::Drift)
+            || matches!(self.mcp_servers, SyncState::Drift)
+        {
+            AgentStatus::Drift
+        } else {
+            AgentStatus::Ok
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SyncStrategy {
@@ -59,6 +107,7 @@ pub struct AgentInfo {
     pub target_path: PathBuf,
     pub status: AgentStatus,
     pub strategy: SyncStrategy,
+    pub sync_status: AgentSyncStatus,
 }
 
 impl ConfigPaths {
@@ -226,20 +275,61 @@ impl ConfigPaths {
     }
 
     pub fn get_agents(&self) -> Vec<AgentInfo> {
+        let global_rules_drifted = self.check_global_rules_drift();
+        let prefs_drifted = self.check_preference_drift();
+
         self.agent_configs
             .iter()
             .map(|def| {
                 let merged_content = self.get_merged_content(def);
+                let rules_status = get_agent_status(
+                    &def.target_path,
+                    &self.project_agents,
+                    &merged_content,
+                    def.strategy,
+                );
+
+                let global_state = if def.global_file.is_none() {
+                    SyncState::NotApplicable
+                } else if global_rules_drifted.contains(&def.name) {
+                    SyncState::Drift
+                } else if def.global_file.as_ref().is_some_and(|f| !f.exists()) {
+                    SyncState::Missing
+                } else {
+                    SyncState::Ok
+                };
+
+                let prefs_state = if prefs_drifted {
+                    SyncState::Drift
+                } else {
+                    SyncState::Ok
+                };
+
+                let mcp_state = if self.preferences.global_prefs.mcp_servers.is_empty() {
+                    SyncState::NotApplicable
+                } else if prefs_drifted {
+                    SyncState::Drift
+                } else {
+                    SyncState::Ok
+                };
+
+                let sync_status = AgentSyncStatus {
+                    rules: match rules_status {
+                        AgentStatus::Ok => SyncState::Ok,
+                        AgentStatus::Missing => SyncState::Missing,
+                        AgentStatus::Drift => SyncState::Drift,
+                    },
+                    global_rules: global_state,
+                    preferences: prefs_state,
+                    mcp_servers: mcp_state,
+                };
+
                 AgentInfo {
                     name: def.name.clone(),
                     target_path: def.target_path.clone(),
-                    status: get_agent_status(
-                        &def.target_path,
-                        &self.project_agents,
-                        &merged_content,
-                        def.strategy,
-                    ),
+                    status: sync_status.overall(),
                     strategy: def.strategy,
+                    sync_status,
                 }
             })
             .collect()
@@ -342,7 +432,6 @@ impl ConfigPaths {
             Box::new(crate::preferences::ClaudeConfigGenerator {
                 config_dir: home.join(".claude"),
                 user_config_path: home.join(".claude.json"),
-                project_path: self.config_file.parent().unwrap_or(Path::new(".")).to_path_buf(),
             }),
             Box::new(crate::preferences::GeminiConfigGenerator {
                 config_dir: home.join(".gemini"),
@@ -402,7 +491,6 @@ impl ConfigPaths {
             Box::new(crate::preferences::ClaudeConfigGenerator {
                 config_dir: home.join(".claude"),
                 user_config_path: home.join(".claude.json"),
-                project_path: self.config_file.parent().unwrap_or(Path::new(".")).to_path_buf(),
             }),
             Box::new(crate::preferences::GeminiConfigGenerator {
                 config_dir: home.join(".gemini"),
@@ -416,7 +504,8 @@ impl ConfigPaths {
             if let Ok(files) = generator.generate(&merged_prefs, Some(&credentials)) {
                 for (path, content) in files {
                     if path.exists() {
-                        if fs::read_to_string(&path).unwrap_or_default() != content {
+                        let existing = fs::read_to_string(&path).unwrap_or_default();
+                        if !json_equal(&existing, &content) {
                             return true;
                         }
                     } else {
@@ -552,6 +641,16 @@ impl ConfigPaths {
         }
 
         warnings
+    }
+}
+
+fn json_equal(a: &str, b: &str) -> bool {
+    let parsed_a: Result<serde_json::Value, _> = serde_json::from_str(a);
+    let parsed_b: Result<serde_json::Value, _> = serde_json::from_str(b);
+
+    match (parsed_a, parsed_b) {
+        (Ok(va), Ok(vb)) => va == vb,
+        _ => a == b,
     }
 }
 

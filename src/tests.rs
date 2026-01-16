@@ -26,10 +26,10 @@ mod tests {
         )
         .unwrap();
 
+        let user_config_path = dir.path().join(".claude.json");
         let generator = crate::preferences::ClaudeConfigGenerator {
             config_dir: config_dir.clone(),
             user_config_path: user_config_path.clone(),
-            project_path: dir.path().to_path_buf(),
         };
 
         let mut prefs = crate::preferences::AgentPreferences::default();
@@ -75,7 +75,6 @@ mod tests {
         let generator = crate::preferences::ClaudeConfigGenerator {
             config_dir: config_dir.clone(),
             user_config_path: user_config_path.clone(),
-            project_path: dir.path().to_path_buf(),
         };
 
         let mut prefs = crate::preferences::AgentPreferences::default();
@@ -89,6 +88,8 @@ mod tests {
                 command: "python".to_string(),
                 args: vec!["main.py".to_string()],
                 env,
+                disabled_tools: Vec::new(),
+                auto_allow: false,
             },
         );
 
@@ -123,6 +124,7 @@ mod tests {
             target_path: PathBuf::from("dummy"),
             status: crate::config::AgentStatus::Ok,
             strategy: crate::config::SyncStrategy::Merge,
+            sync_status: crate::config::AgentSyncStatus::default(),
         }];
 
         let defaults = vec![
@@ -151,6 +153,8 @@ mod tests {
                             command: cmd.to_string(),
                             args: args.iter().map(|s| s.to_string()).collect(),
                             env: std::collections::HashMap::new(),
+                            disabled_tools: Vec::new(),
+                            auto_allow: false,
                         },
                     );
                 }
@@ -187,6 +191,8 @@ mod tests {
                 command: "echo".to_string(),
                 args: vec![],
                 env: std::collections::HashMap::new(),
+                disabled_tools: Vec::new(),
+                auto_allow: false,
             },
         );
         global_prefs.mcp_servers.insert(
@@ -195,6 +201,8 @@ mod tests {
                 command: "echo".to_string(),
                 args: vec![],
                 env: std::collections::HashMap::new(),
+                disabled_tools: Vec::new(),
+                auto_allow: false,
             },
         );
         mgr.global_prefs = global_prefs;
@@ -214,5 +222,60 @@ mod tests {
                 .disabled_mcp_servers
                 .contains(&"global-server".to_string())
         );
+    }
+
+    #[test]
+    fn test_claude_permissions_format() {
+        let dir = tempdir().unwrap();
+        let config_dir = dir.path().join(".claude");
+        fs::create_dir_all(&config_dir).unwrap();
+
+        let user_config_path = dir.path().join(".claude.json");
+        let generator = crate::preferences::ClaudeConfigGenerator {
+            config_dir: config_dir.clone(),
+            user_config_path: user_config_path.clone(),
+        };
+
+        let mut prefs = crate::preferences::AgentPreferences::default();
+        prefs.tool_permissions.allow.push("Bash(npm:*)".to_string());
+        prefs.tool_permissions.ask.push("Bash(git push:*)".to_string());
+        prefs.tool_permissions.deny.push("Read(./.env)".to_string());
+
+        prefs.mcp_servers.insert(
+            "test-server".to_string(),
+            crate::preferences::McpServerConfig::Stdio {
+                command: "test".to_string(),
+                args: vec![],
+                env: std::collections::HashMap::new(),
+                disabled_tools: vec!["dangerous_tool".to_string()],
+                auto_allow: true,
+            },
+        );
+
+        let results = generator.generate(&prefs, None).unwrap();
+
+        let settings_path = config_dir.join("settings.json");
+        let (_, content) = results.iter().find(|(p, _)| p == &settings_path).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(content).unwrap();
+
+        assert!(settings["permissions"].is_object());
+        assert!(settings["permissions"]["allow"].is_array());
+        assert!(settings["permissions"]["ask"].is_array());
+        assert!(settings["permissions"]["deny"].is_array());
+
+        let allow = settings["permissions"]["allow"].as_array().unwrap();
+        let ask = settings["permissions"]["ask"].as_array().unwrap();
+        let deny = settings["permissions"]["deny"].as_array().unwrap();
+
+        // User-defined permissions are preserved
+        assert!(allow.iter().any(|v| v.as_str() == Some("Bash(npm:*)")));
+        assert!(ask.iter().any(|v| v.as_str() == Some("Bash(git push:*)")));
+        assert!(deny.iter().any(|v| v.as_str() == Some("Read(./.env)")));
+
+        // MCP server with auto_allow gets wildcard permission
+        assert!(allow.iter().any(|v| v.as_str() == Some("mcp__test-server__*")));
+
+        // Disabled MCP tool gets exact deny entry (not wildcard pattern)
+        assert!(deny.iter().any(|v| v.as_str() == Some("mcp__test-server__dangerous_tool")));
     }
 }
